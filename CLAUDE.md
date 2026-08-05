@@ -71,7 +71,12 @@ The second form is what proves the wrapper, and there is no substitute for it: c
 decoding, cursors, clipboard and resize are all things a unit test can only pretend to exercise.
 Run it against both a Linux xrdp and a real Windows host — they fail differently, and the Windows
 path is the one with CredSSP, NTLM, the graphics-pipeline decision and the layout timing in it.
-The resize leg skips itself, loudly, against a server with no DisplayControl.
+Two legs report rather than assert, because both are properties of the *server*: resize skips
+itself against a host with no DisplayControl, and the clipboard says so if the channel is never
+offered. The clipboard leg only drives the half a program can — it advertises a format and
+carries on — because the other half needs somebody to press paste on the remote. That is still
+worth running: the one clipboard bug this crate has had presented as the *session* ending a
+second after connecting, so what it really checks is that a session survives its own clipboard.
 
 ## Scope
 

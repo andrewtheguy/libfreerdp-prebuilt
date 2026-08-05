@@ -21,7 +21,11 @@
 //!
 //! Exit code 0 means every check that ran passed. Anything else prints why.
 
-use freerdp::{Connect, Event, Session};
+use freerdp::{ClipboardEvent, ClipboardFormat, Connect, Event, Session};
+
+/// `CF_UNICODETEXT`, Windows' own id for plain text. Named here rather than imported
+/// because the engine crate deliberately carries format ids as plain numbers.
+const CF_UNICODETEXT: u32 = 13;
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -110,6 +114,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let mut painted = 0usize;
     let mut pixels = 0usize;
     let mut resize_ready = false;
+    let mut clipboard_ready = false;
 
     while Instant::now() < deadline {
         let Ok(event) = events.recv_timeout(Duration::from_secs(5)) else { continue };
@@ -132,6 +137,21 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
                 println!("displaycontrol  up to {max_monitors} monitors, {max_area} pixels");
                 resize_ready = true;
             }
+            Event::Clipboard(ClipboardEvent::Ready) => {
+                println!("cliprdr         capability exchange finished");
+                clipboard_ready = true;
+                // Advertise something, which is the half of the clipboard a test can
+                // drive on its own — the other half needs a person to press paste on
+                // the remote. Worth doing here rather than nowhere: the one clipboard
+                // bug this crate has had was a callback returning the wrong kind of
+                // success, and it presented as the *session* ending a second after
+                // connecting rather than as anything clipboard-shaped. So what is
+                // being checked is that the session survives its own clipboard.
+                if let Some(clipboard) = session.clipboard() {
+                    clipboard.advertise(vec![ClipboardFormat::new(CF_UNICODETEXT)]);
+                }
+            }
+            Event::Clipboard(other) => println!("cliprdr         {other:?}"),
             Event::Ended(result) => {
                 panic!("the session ended before it painted: {result:?}");
             }
@@ -142,6 +162,12 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let (width, height) = connected.expect("the session never reported a desktop size");
     assert!(painted > 0, "connected to {host} but nothing ever painted");
     println!("painted         {painted} rectangles, {pixels} pixels");
+    // Not an assertion: a server may not offer the clipboard at all, and this
+    // program runs against whatever the pipeline could start. Reported so that a
+    // silent absence is visible rather than looking like coverage.
+    if !clipboard_ready {
+        println!("cliprdr         not offered by this server");
+    }
 
     // The framebuffer is not merely allocated: something wrote to it. A connected session whose
     // buffer is entirely zero is exactly the black-screen failure that decided this crate would
