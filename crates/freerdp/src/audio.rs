@@ -128,7 +128,27 @@ impl std::fmt::Debug for Audio {
 const SUBSYSTEM: &CStr = c"rust";
 
 /// The `sys:` argument spelled the way `rdpsnd_process_addin_args` parses it.
+///
+/// Spelled out rather than built from [`SUBSYSTEM`], because it has to be a `CStr` a channel
+/// argument list can point at and there is no const way to concatenate one. The name is therefore
+/// written twice, and the assertion below is what stops the two drifting: a mismatch is the
+/// failure that loads FreeRDP's `fake` device and plays silence without saying so, so it is worth
+/// catching at compile time rather than by ear.
 pub(crate) const SUBSYSTEM_ARG: &CStr = c"sys:rust";
+
+const _: () = {
+    let (arg, name) = (SUBSYSTEM_ARG.to_bytes(), SUBSYSTEM.to_bytes());
+    assert!(arg.len() == 4 + name.len(), "SUBSYSTEM_ARG is not `sys:` followed by SUBSYSTEM");
+    assert!(
+        arg[0] == b's' && arg[1] == b'y' && arg[2] == b's' && arg[3] == b':',
+        "SUBSYSTEM_ARG does not start with the `sys:` prefix rdpsnd parses"
+    );
+    let mut i = 0;
+    while i < name.len() {
+        assert!(arg[4 + i] == name[i], "SUBSYSTEM_ARG names a different subsystem to SUBSYSTEM");
+        i += 1;
+    }
+};
 
 /// FreeRDP's own provider, kept so everything that is not this device still loads.
 ///
@@ -364,6 +384,19 @@ unsafe extern "C" fn free(device: *mut sys::rdpsndDevicePlugin) {
     guarded("rdpsnd Free", (), || {
         if device.is_null() {
             return;
+        }
+        // Withdrawn from the bridge *before* the allocation goes, because rdpsnd frees an open
+        // device — the teardown path calls `Free` without a matching `Close` — and what would be
+        // left behind is a dangling pointer that the next device's `Open` compares itself against
+        // and loses to. That is a session whose sound never comes back after the channel is
+        // reloaded. Only when it still refers to this device, for the same reason `close` checks:
+        // a device that never won the claim must not clear somebody else's.
+        //
+        // SAFETY: the caller's device, still alive until the drop below.
+        if let Some((bridge, _)) = unsafe { audio(device) } {
+            if bridge.audio_device == device {
+                bridge.audio_device = std::ptr::null_mut();
+            }
         }
         // SAFETY: `Device` starts with the plugin struct, so the two pointers are the same
         // address, and this is the box `subsystem_entry` leaked. Reclaimed exactly once: rdpsnd

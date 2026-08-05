@@ -147,8 +147,16 @@ device — `rdpsnd` loads a backend the way an ordinary client loads ALSA, and t
 things about that are worth knowing before touching it: the subsystem has to be *named*, because a
 build with no audio backend falls through to FreeRDP's `fake` device and plays silence without
 saying so; and turning sound on makes a Windows host start measuring the link, which is why
-`SupportMultitransport` and `SupportHeartbeatPdu` are off — measured, five session deaths out of
-five, in `apply_settings`.
+`NetworkAutoDetect`, `SupportMultitransport` and `SupportHeartbeatPdu` are **all three** off —
+declining the first is not enough, because either of the other two opens the MCS message channel
+those PDUs arrive on. Measured: five session deaths out of five, and all three stay off in
+`apply_settings`.
+
+The one thing that is not per-session is the addin provider FreeRDP finds a device through: it is a
+**process global**, and `freerdp_client_context_new` reinstalls FreeRDP's own on every call. So a
+`Session::start` that overlaps another session's connection setup can take that session's audio
+device away from it, leaving it silent. Sessions that overlap only after both have connected are
+unaffected, because by then each has loaded its own device.
 
 What it does **not** do, deliberately: no microphone, no graphics pipeline, no certificate
 verification, no file-transfer clipboard, no multiple monitors, and no retrying of a resize. Each
