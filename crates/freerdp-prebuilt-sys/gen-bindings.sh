@@ -41,6 +41,17 @@
 # each side needs its own sysroot. CI runs this on macOS and on both Linux targets, which is what
 # keeps both files honest — and asserts that the two Linux architectures agree, so that
 # `bindings_linux.rs` is one file rather than two.
+#
+# **That last assertion failed the first time it ran**, on the aarch64 job of the first release,
+# and what it found is why the blocklist in `generate()` is longer than it looks like it needs to
+# be. x86_64 and aarch64 Linux differed in exactly three things: `va_list` (a struct array on one,
+# an opaque `[u64; 4]` on the other), WinPR's `_M_AMD64`/`_M_ARM64` identification macros, and
+# `MEMORY_ALLOCATION_ALIGNMENT`, 16 against 8. **No FreeRDP type's size, alignment or field offset
+# differed** — which is the measurement that says one file per platform is correct rather than
+# merely convenient, because everything this crate exists to describe is identical. The three are
+# architecture facts that arrived through nine variadic functions nothing here calls, so they are
+# blocklisted for the same reason glibc's `FILE` is, and `assert_complete` now refuses to write a
+# file that names an architecture at all.
 # ---------------------------------------------------------------------------------------------
 set -euo pipefail
 
@@ -136,6 +147,17 @@ generate() {
     --blocklist-type '_IO_.*' \
     --blocklist-type '__sFILE.*' \
     --blocklist-type '__sbuf' \
+    --blocklist-function 'WLog_PrintMessageVA' \
+    --blocklist-function 'WLog_PrintTextMessageVA' \
+    --blocklist-function 'winpr_vasprintf' \
+    --blocklist-function 'Stream_CheckAndLogRequired(Capacity|Length)(WLog)?ExVa' \
+    --blocklist-function 'ArrayList_ForEachAP' \
+    --blocklist-function 'ArrayList_ForEach' \
+    --blocklist-type 'ArrayList_ForEachFkt' \
+    --blocklist-type '(__builtin_|__gnuc_)?va_list' \
+    --blocklist-type '__va_list_tag' \
+    --blocklist-item '_M_[A-Z0-9_]*' \
+    --blocklist-item 'MEMORY_ALLOCATION_ALIGNMENT' \
     --default-enum-style consts \
     --constified-enum-module 'FreeRDP_Settings_Keys_.*' \
     --no-doc-comments \
@@ -157,6 +179,12 @@ generate() {
     --raw-line "// between one distribution's glibc and another's, so the committed file was only" \
     --raw-line "// valid on the machine that made it. Both functions are blocklisted; nothing in" \
     --raw-line "// this repository calls them, and a caller that wants one can use libc's own." \
+    --raw-line "//" \
+    --raw-line "// The same rule, one level down: \`va_list\`, WinPR's \`_M_*\` architecture macros and" \
+    --raw-line "// MEMORY_ALLOCATION_ALIGNMENT describe the *architecture*, not FreeRDP's API, and" \
+    --raw-line "// they are the only things that differed between x86_64 and aarch64 Linux — no" \
+    --raw-line "// FreeRDP struct's size or offset did. Blocklisted, so this one file is honestly" \
+    --raw-line "// portable across both rather than nearly so; see gen-bindings.sh." \
     --raw-line "#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]" \
     --raw-line "#![allow(clippy::all)]" \
     -- -I include/freerdp3 -I include/winpr3
@@ -185,6 +213,26 @@ assert_complete() {
       return 1
     }
   done
+  # Nothing that names the architecture, which is what makes one file per *platform* legitimate
+  # rather than one per platform-and-architecture.
+  #
+  # Measured, on a release that failed for it: bindgen on aarch64 Linux and on x86_64 Linux
+  # produced files differing in exactly three things — `va_list` (a struct array on x86_64, an
+  # opaque `[u64; 4]` on aarch64), WinPR's `_M_AMD64`/`_M_ARM64` identification macros, and
+  # `MEMORY_ALLOCATION_ALIGNMENT` (16 against 8). No FreeRDP struct's size, alignment or field
+  # offset differed at all, which is the finding that says one file is *right* and not merely
+  # convenient. All three are blocklisted above; this is what stops a future header change
+  # reintroducing one and being found by a release rather than by a generation.
+  #
+  # `^[^/]*` so the file's own header comment — which explains this rule and therefore names
+  # every item in it — is not itself a violation of it.
+  if grep -nE '^[^/]*(va_list|__va_list_tag|_M_[A-Z0-9_]+|MEMORY_ALLOCATION_ALIGNMENT)' "$file" >&2; then
+    echo "the generated bindings name the architecture at the lines above." >&2
+    echo "  This file is committed once per platform and used on both of its architectures, so" >&2
+    echo "  an architecture-dependent item makes it wrong on one of them. Blocklist it in" >&2
+    echo "  generate() beside the others, or split the file per architecture." >&2
+    return 1
+  fi
   # And a floor, which is what catches the *formatting* going wrong rather than the content: an
   # unformatted binding of the same declarations is about sixteen very long lines.
   lines="$(wc -l < "$file")"

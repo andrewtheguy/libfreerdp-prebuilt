@@ -18,10 +18,15 @@
 // between one distribution's glibc and another's, so the committed file was only
 // valid on the machine that made it. Both functions are blocklisted; nothing in
 // this repository calls them, and a caller that wants one can use libc's own.
+//
+// The same rule, one level down: `va_list`, WinPR's `_M_*` architecture macros and
+// MEMORY_ALLOCATION_ALIGNMENT describe the *architecture*, not FreeRDP's API, and
+// they are the only things that differed between x86_64 and aarch64 Linux — no
+// FreeRDP struct's size or offset did. Blocklisted, so this one file is honestly
+// portable across both rather than nearly so; see gen-bindings.sh.
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 #![allow(clippy::all)]
 
-pub const _M_ARM64: u32 = 1;
 pub const __MACOSX__: u32 = 1;
 pub const SPI_SETSCREENSAVEACTIVE: u32 = 17;
 pub const HCF_HIGHCONTRASTON: u32 = 1;
@@ -69,7 +74,6 @@ pub const SKF_RALTLATCHED: u32 = 536870912;
 pub const SKF_LWINLATCHED: u32 = 1073741824;
 pub const SKF_RWINLATCHED: u32 = 2147483648;
 pub const SPI_SETSCREENSAVESECURE: u32 = 119;
-pub const MEMORY_ALLOCATION_ALIGNMENT: u32 = 8;
 pub const MINCHAR: u32 = 128;
 pub const MAXCHAR: u32 = 127;
 pub const MINSHORT: u32 = 32768;
@@ -6080,7 +6084,6 @@ extern "C" {
         line: usize,
     ) -> !;
 }
-pub type va_list = __builtin_va_list;
 pub type fpos_t = __darwin_off_t;
 pub const SystemParam_SPI_SETDRAGFULLWINDOWS: SystemParam = 37;
 pub const SystemParam_SPI_SETKEYBOARDCUES: SystemParam = 4107;
@@ -9101,17 +9104,6 @@ extern "C" {
     ) -> BOOL;
 }
 extern "C" {
-    pub fn WLog_PrintTextMessageVA(
-        log: *mut wLog,
-        level: DWORD,
-        line: usize,
-        file: *const ::std::os::raw::c_char,
-        function: *const ::std::os::raw::c_char,
-        fmt: *const ::std::os::raw::c_char,
-        args: va_list,
-    ) -> BOOL;
-}
-extern "C" {
     pub fn WLog_PrintMessage(
         log: *mut wLog,
         type_: DWORD,
@@ -9120,17 +9112,6 @@ extern "C" {
         file: *const ::std::os::raw::c_char,
         function: *const ::std::os::raw::c_char,
         ...
-    ) -> BOOL;
-}
-extern "C" {
-    pub fn WLog_PrintMessageVA(
-        log: *mut wLog,
-        type_: DWORD,
-        level: DWORD,
-        line: usize,
-        file: *const ::std::os::raw::c_char,
-        function: *const ::std::os::raw::c_char,
-        args: va_list,
     ) -> BOOL;
 }
 extern "C" {
@@ -9355,17 +9336,6 @@ extern "C" {
     ) -> BOOL;
 }
 extern "C" {
-    pub fn Stream_CheckAndLogRequiredCapacityExVa(
-        tag: *const ::std::os::raw::c_char,
-        level: DWORD,
-        s: *mut wStream,
-        nmemb: usize,
-        size: usize,
-        fmt: *const ::std::os::raw::c_char,
-        args: va_list,
-    ) -> BOOL;
-}
-extern "C" {
     pub fn Stream_CheckAndLogRequiredCapacityWLogEx(
         log: *mut wLog,
         level: DWORD,
@@ -9374,17 +9344,6 @@ extern "C" {
         size: usize,
         fmt: *const ::std::os::raw::c_char,
         ...
-    ) -> BOOL;
-}
-extern "C" {
-    pub fn Stream_CheckAndLogRequiredCapacityWLogExVa(
-        log: *mut wLog,
-        level: DWORD,
-        s: *mut wStream,
-        nmemb: usize,
-        size: usize,
-        fmt: *const ::std::os::raw::c_char,
-        args: va_list,
     ) -> BOOL;
 }
 extern "C" {
@@ -9415,17 +9374,6 @@ extern "C" {
     ) -> BOOL;
 }
 extern "C" {
-    pub fn Stream_CheckAndLogRequiredLengthExVa(
-        tag: *const ::std::os::raw::c_char,
-        level: DWORD,
-        s: *mut wStream,
-        nmemb: usize,
-        size: usize,
-        fmt: *const ::std::os::raw::c_char,
-        args: va_list,
-    ) -> BOOL;
-}
-extern "C" {
     pub fn Stream_CheckAndLogRequiredLengthWLogEx(
         log: *mut wLog,
         level: DWORD,
@@ -9434,17 +9382,6 @@ extern "C" {
         size: usize,
         fmt: *const ::std::os::raw::c_char,
         ...
-    ) -> BOOL;
-}
-extern "C" {
-    pub fn Stream_CheckAndLogRequiredLengthWLogExVa(
-        log: *mut wLog,
-        level: DWORD,
-        s: *mut wStream,
-        nmemb: usize,
-        size: usize,
-        fmt: *const ::std::os::raw::c_char,
-        args: va_list,
     ) -> BOOL;
 }
 extern "C" {
@@ -14882,14 +14819,6 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn winpr_vasprintf(
-        s: *mut *mut ::std::os::raw::c_char,
-        slen: *mut usize,
-        templ: *const ::std::os::raw::c_char,
-        ap: va_list,
-    ) -> ::std::os::raw::c_int;
-}
-extern "C" {
     pub fn _strdup(strSource: *const ::std::os::raw::c_char) -> *mut ::std::os::raw::c_char;
 }
 extern "C" {
@@ -15379,19 +15308,6 @@ extern "C" {
 }
 extern "C" {
     pub fn ArrayList_Object(arrayList: *mut wArrayList) -> *mut wObject;
-}
-pub type ArrayList_ForEachFkt = ::std::option::Option<
-    unsafe extern "C" fn(data: *mut ::std::os::raw::c_void, index: usize, ap: va_list) -> BOOL,
->;
-extern "C" {
-    pub fn ArrayList_ForEach(arrayList: *mut wArrayList, fkt: ArrayList_ForEachFkt, ...) -> BOOL;
-}
-extern "C" {
-    pub fn ArrayList_ForEachAP(
-        arrayList: *mut wArrayList,
-        fkt: ArrayList_ForEachFkt,
-        ap: va_list,
-    ) -> BOOL;
 }
 extern "C" {
     pub fn ArrayList_Clear(arrayList: *mut wArrayList);
@@ -30307,4 +30223,3 @@ const _: () = {
     ["Offset of field: s_disp_client_context::SendMonitorLayout"]
         [::std::mem::offset_of!(s_disp_client_context, SendMonitorLayout) - 24usize];
 };
-pub type __builtin_va_list = *mut ::std::os::raw::c_char;
