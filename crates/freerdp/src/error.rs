@@ -54,6 +54,28 @@ impl Error {
         };
         Self { code, message }
     }
+
+    /// Whether this is a failure to *reach* the host, as opposed to one the host answered with.
+    ///
+    /// The distinction matters to an embedder because the two have different audiences: a rejected
+    /// password is for the person who typed it, and an unreachable address is for whoever owns the
+    /// network — or, on macOS 15 and later, for whoever has not yet granted the app local network
+    /// access, which is refused in a way indistinguishable from an address with no route.
+    ///
+    /// Only the two codes that mean the transport never came up. DNS failures are deliberately not
+    /// included: a name that does not resolve is a decided answer, and calling it "unreachable"
+    /// would send a reader to check a network that is fine.
+    pub fn is_unreachable(&self) -> bool {
+        // The class is in the high half and the reason in the low half — `0x0002000B` is
+        // `ERRCONNECT_CONNECT_CANCELLED`. Comparing the whole word against a bare constant is the
+        // mistake this masking exists to avoid.
+        self.code >> 16 == freerdp_sys::FREERDP_ERROR_CONNECT_CLASS
+            && matches!(
+                self.code & 0xFFFF,
+                freerdp_sys::ERRCONNECT_CONNECT_FAILED
+                    | freerdp_sys::ERRCONNECT_CONNECT_TRANSPORT_FAILED
+            )
+    }
 }
 
 impl fmt::Display for Error {
@@ -71,3 +93,32 @@ impl fmt::Debug for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The masking, pinned against the one code seen in a real log — a session this crate aborted
+    /// itself reports `0x0002000B`, which is in the connect class and is *not* unreachable.
+    #[test]
+    fn only_a_transport_that_never_came_up_is_unreachable() {
+        let of = |code| Error { code, message: String::new() };
+        let connect = freerdp_sys::FREERDP_ERROR_CONNECT_CLASS << 16;
+
+        assert!(of(connect | freerdp_sys::ERRCONNECT_CONNECT_FAILED).is_unreachable());
+        assert!(of(connect | freerdp_sys::ERRCONNECT_CONNECT_TRANSPORT_FAILED).is_unreachable());
+
+        // Answered by the host, so not a network question.
+        assert!(!of(connect | freerdp_sys::ERRCONNECT_LOGON_FAILURE).is_unreachable());
+        assert!(!of(connect | freerdp_sys::ERRCONNECT_AUTHENTICATION_FAILED).is_unreachable());
+        assert!(!of(connect | freerdp_sys::ERRCONNECT_DNS_NAME_NOT_FOUND).is_unreachable());
+        assert_eq!(0x0002_000B, connect | freerdp_sys::ERRCONNECT_CONNECT_CANCELLED);
+        assert!(!of(0x0002_000B).is_unreachable());
+
+        // A different class whose low half collides with one of the two above.
+        let errinfo = freerdp_sys::FREERDP_ERROR_ERRINFO_CLASS << 16;
+        assert!(!of(errinfo | freerdp_sys::ERRCONNECT_CONNECT_FAILED).is_unreachable());
+        // And this crate's own failures, which carry no code at all.
+        assert!(!Error::local("no").is_unreachable());
+    }
+}
