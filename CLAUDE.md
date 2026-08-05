@@ -33,7 +33,23 @@ is only the things that are easy to get wrong.
   build asserts each channel's entry-point symbol for that reason.
 - **The archives' channel set is frozen at configure time.** `channels/client/CMakeLists.txt`
   generates the addin table from the enabled set, so a consumer cannot turn one on later. That is
-  why `rdpsnd`, `disp` and `rdpgfx` are built in even though the wrapper calls none of them.
+  why `rdpgfx` is built in even though the wrapper calls it not at all — and why `rdpsnd` and
+  `disp` needed no new archive when they were picked up.
+- **Sound is not a channel you subscribe to, it is a device you register.** `rdpsnd` publishes no
+  client context: it loads a backend through the process-global addin provider, so `audio.rs`
+  chains in front of FreeRDP's own and answers for one subsystem name. Two consequences. The name
+  has to reach the channel as a `sys:` argument — with none, `rdpsnd_process_connect` walks its
+  compiled-in backends and this build's list ends in `fake`, which accepts every format and
+  discards every buffer, so the failure is *silence with no error anywhere*. And the provider
+  being global means a second `freerdp_client_context_new` takes it back; a session starting while
+  another is still inside `freerdp_connect` can cost that one its device.
+- **Turning sound on makes a Windows host start measuring the link.** Measured: with `rdpsnd`
+  loaded, a Windows 11 host began continuous network characteristics detection within seconds and
+  the session died **five times out of five** — `autodetect_recv_request_packet` answers a request
+  it was not configured for with `STATE_RUN_FAILED`. Declining `NetworkAutoDetect` is not enough,
+  because the MCS message channel those PDUs arrive on is opened by `SupportMultitransport` or
+  `SupportHeartbeatPdu` too, and both default to on. All three are off together in
+  `apply_settings`, and they have to stay that way.
 - **cliprdr and disp callbacks return a channel error code, where 0 is success** — the opposite of
   every other callback in the wrapper. Returning 1 from `MonitorReady` tears the session down and
   surfaces to the caller as an orderly `Ended(Ok(()))` a second after connecting.
@@ -72,9 +88,12 @@ The second form is what proves the wrapper, and there is no substitute for it: c
 decoding, cursors, clipboard and resize are all things a unit test can only pretend to exercise.
 Run it against both a Linux xrdp and a real Windows host — they fail differently, and the Windows
 path is the one with CredSSP, NTLM, the graphics-pipeline decision and the layout timing in it.
-Two legs report rather than assert, because both are properties of the *server*: resize skips
-itself against a host with no DisplayControl, and the clipboard says so if the channel is never
-offered. The clipboard leg only drives the half a program can — it advertises a format and
+Three legs report rather than assert, because all three are properties of the *server*: resize
+skips itself against a host with no DisplayControl, the clipboard says so if the channel is never
+offered, and audio says so if `rdpsnd` is not offered or the desktop simply made no noise. The
+audio leg's one real assertion is that `negotiated` fired at all, which is how the `fake` device
+is told from this crate's — and to exercise the half only ears can settle, make the remote play
+something while it runs. The clipboard leg only drives the half a program can — it advertises a format and
 carries on — because the other half needs somebody to press paste on the remote. That is still
 worth running: the one clipboard bug this crate has had presented as the *session* ending a
 second after connecting, so what it really checks is that a session survives its own clipboard.
@@ -82,5 +101,7 @@ second after connecting, so what it really checks is that a session survives its
 ## Scope
 
 This repository builds archives and wraps them. It is not where RDP features get designed: if a
-consumer needs audio, the channel is already in the archives and the work is new code in
-`crates/freerdp`, not a new build. Resize went in that way and needed no new archive.
+consumer needs a channel the archives already carry, the work is new code in `crates/freerdp`, not
+a new build. Resize and audio both went in that way and neither needed a new archive — audio did
+need the `rdpsnd` headers added to `wrapper.h` and the bindings regenerated on **both** platforms,
+which is the one step that cannot be done from one machine.

@@ -116,7 +116,8 @@ the two files differ in 626 lines.
 
 ## The wrapper
 
-`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse, clipboard and resize.
+`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse, clipboard, resize and
+sound.
 
 ```rust
 let (session, events) = Session::start(Connect { host, username, password, ..Default::default() });
@@ -139,7 +140,17 @@ Dynamic resize is there but **off by default** (`Connect::resize`), because a se
 monitor layout by renegotiating the whole session — the most disruptive thing a client can ask
 for, and a session that never asks never meets it.
 
-What it does **not** do, deliberately: no audio, no graphics pipeline, no certificate
+Sound is off by default too (`Connect::audio`), and arrives differently from everything else: not
+as an `Event` but through an `AudioSink` called on the FreeRDP thread, so a wave buffer never
+queues behind a backlog of paint rectangles. The way in is that `crates/freerdp` **is** the audio
+device — `rdpsnd` loads a backend the way an ordinary client loads ALSA, and this one is Rust. Two
+things about that are worth knowing before touching it: the subsystem has to be *named*, because a
+build with no audio backend falls through to FreeRDP's `fake` device and plays silence without
+saying so; and turning sound on makes a Windows host start measuring the link, which is why
+`SupportMultitransport` and `SupportHeartbeatPdu` are off — measured, five session deaths out of
+five, in `apply_settings`.
+
+What it does **not** do, deliberately: no microphone, no graphics pipeline, no certificate
 verification, no file-transfer clipboard, no multiple monitors, and no retrying of a resize. Each
 of those is documented where it is decided, with the reason. The EGFX one is worth repeating: against a Windows 11 host with the
 graphics pipeline advertised, FreeRDP decoded 21 surface commands with no errors and produced a

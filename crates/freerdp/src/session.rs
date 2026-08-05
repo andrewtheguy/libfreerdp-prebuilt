@@ -16,6 +16,7 @@
 
 use freerdp_sys as sys;
 
+use crate::audio::{self, Audio};
 use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
 use crate::error::Error;
 use crate::framebuffer::{Framebuffer, Rect};
@@ -90,6 +91,14 @@ pub struct Connect {
     pub security: Security,
     /// Whether to load `cliprdr`. When false there is no [`Session::clipboard`].
     pub clipboard: bool,
+    /// Whether to load `rdpsnd` and where its wave buffers go. `None` asks the server for no
+    /// sound at all, which is the default.
+    ///
+    /// Unlike every other output this crate produces, sound does **not** arrive as an [`Event`]:
+    /// the sink is called on the FreeRDP thread as each buffer is decoded. That is what keeps it
+    /// off the back of a queue of paint rectangles — see [`AudioSink`](crate::AudioSink), which
+    /// also says what a sink may not do on that thread.
+    pub audio: Option<Audio>,
     /// Whether to load `disp` and advertise DisplayControl, which is what makes
     /// [`Input::resize`](crate::Input::resize) do anything.
     ///
@@ -120,6 +129,7 @@ impl Default for Connect {
             height: 768,
             security: Security::default(),
             clipboard: true,
+            audio: None,
             resize: false,
             connect_timeout: Duration::from_secs(15),
             keepalive: KeepAlive::default(),
@@ -427,9 +437,15 @@ struct WrapperContext {
 ///
 /// Only ever touched on the FreeRDP thread — `Session` holds no reference to it — so there are no
 /// locks here beyond the ones inside `Shared`.
-struct Bridge {
+pub(crate) struct Bridge {
     events: Sender<Event>,
     shared: Arc<Shared>,
+    /// Where redirected sound goes, and `None` on a session that asked for none — in which case
+    /// `rdpsnd` was never registered and nothing in `audio.rs` can be reached at all.
+    pub(crate) audio: Option<Audio>,
+    /// Which `rdpsnd` device is playing. See `audio::open`: the channel is registered twice, as a
+    /// static channel and a dynamic one, and only one of them may fill the sink.
+    pub(crate) audio_device: *mut sys::rdpsndDevicePlugin,
     cliprdr: *mut sys::CliprdrClientContext,
     /// Whether the capability exchange finished. A format list sent before it is discarded by the
     /// peer, so `advertise` calls that arrive early are held until this is true.
@@ -460,7 +476,7 @@ impl Bridge {
 /// `ctx` must be a context this crate created, still alive, and with `bridge` already set — which
 /// is true from the moment `run` stores it, and therefore in every callback, since none can fire
 /// before `freerdp_connect`.
-unsafe fn bridge<'a>(ctx: *mut sys::rdpContext) -> Option<&'a mut Bridge> {
+pub(crate) unsafe fn bridge<'a>(ctx: *mut sys::rdpContext) -> Option<&'a mut Bridge> {
     if ctx.is_null() {
         return None;
     }
@@ -479,7 +495,7 @@ unsafe fn bridge<'a>(ctx: *mut sys::rdpContext) -> Option<&'a mut Bridge> {
 /// defensive programming — it is the thing that makes these functions sound to hand to a C
 /// library at all. The panic is printed rather than swallowed, and the `FALSE` that comes back
 /// ends the session, so it does not disappear.
-fn guarded<R>(what: &str, fallback: R, body: impl FnOnce() -> R) -> R {
+pub(crate) fn guarded<R>(what: &str, fallback: R, body: impl FnOnce() -> R) -> R {
     std::panic::catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| {
         eprintln!("freerdp: a panic escaped the {what} callback; ending the session");
         fallback
@@ -511,6 +527,8 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
     let bridge = Box::into_raw(Box::new(Bridge {
         events: events.clone(),
         shared: Arc::clone(shared),
+        audio: config.audio.clone(),
+        audio_device: std::ptr::null_mut(),
         cliprdr: std::ptr::null_mut(),
         clipboard_ready: false,
         pending_advertise: None,
@@ -576,6 +594,15 @@ fn run_connected(
 
     apply_settings(config, ctx)?;
     subscribe_channels(ctx)?;
+
+    // As late as possible, and only when there is sound to carry. FreeRDP's addin provider is a
+    // process global that `freerdp_client_context_new` overwrites, so the window in which another
+    // session could take it back is the gap between here and `freerdp_connect` loading the
+    // channels — narrow rather than closed, and `audio::install_provider` says why it cannot be
+    // closed at all.
+    if config.audio.is_some() {
+        audio::install_provider()?;
+    }
 
     // Dropped before it ever connected — which is not rare, it is what a caller that changed its
     // mind looks like — so there is nothing to connect *to* any more. Checked here rather than
@@ -680,7 +707,35 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // `ConnectionType` is only a starting guess the server then overrides with what
         // it measured, so leaving this true would give the throttling back.
         (B::FreeRDP_NetworkAutoDetect, false),
+        // **And the third half, which declining auto-detect does not buy on its own.**
+        //
+        // Saying no to network detection stops this client *advertising*
+        // `RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT`, and stops nothing else: the MCS message
+        // channel that the detection PDUs travel on is opened by any of these three
+        // settings (`gcc_write_client_message_channel_data`), and both of the others
+        // default to on. A Windows host then sends a continuous RTT Measure Request down
+        // it anyway — and `autodetect_recv_request_packet` answers a request it was not
+        // configured for with `STATE_RUN_FAILED`, which ends the session.
+        //
+        // Measured, and the reason this is here rather than in a note: with `rdpsnd`
+        // loaded, a Windows 11 host began that detection within seconds of the desktop
+        // going active and killed the session **five times out of five**; the same host,
+        // the same build and the same seconds with no audio channel did it in none of
+        // three. Turning sound on is what makes the server start caring how fast the link
+        // is, so a client that has declined to answer must also decline to be asked.
+        //
+        // What is given up: multitransport is UDP side-channels this crate never sets up,
+        // and the heartbeat is a liveness signal the TCP keepalives above already provide
+        // — with `TcpAckTimeout` bounding an unacknowledged write, which is the case a
+        // heartbeat would have caught.
+        (B::FreeRDP_SupportMultitransport, false),
+        (B::FreeRDP_SupportHeartbeatPdu, false),
         (B::FreeRDP_RedirectClipboard, config.clipboard),
+        // Sound. Like the clipboard's key this is both the capability and the channel switch —
+        // `freerdp_client_load_addins` maps it to `rdpsnd` — but unlike the clipboard's it is not
+        // sufficient on its own, because a channel with no `sys:` argument picks its own backend
+        // and this build's list ends in `fake`. `register_audio_channels` below puts the name in.
+        (B::FreeRDP_AudioPlayback, config.audio.is_some()),
         // Software GDI: FreeRDP decodes into `gdi->primary_buffer` rather than into a hardware
         // surface. That *is* the headless path — `gdi_init` below has nothing to draw on
         // otherwise — and it is what makes `EndPaint` mean "these pixels are ready".
@@ -742,6 +797,36 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         {
             return Err(Error::local("a boolean setting was rejected by FreeRDP"));
         }
+    }
+
+    if config.audio.is_some() {
+        register_audio_channels(settings)?;
+    }
+    Ok(())
+}
+
+/// Register `rdpsnd` by hand, naming this crate's device as its subsystem.
+///
+/// Both ways round, because which transport carries MS-RDPEA is the *server's* choice: a modern
+/// Windows host opens `AUDIO_PLAYBACK_DVC` over drdynvc, an older one or a proxy uses the static
+/// `rdpsnd` channel, and a client that registered only one of them would simply get no sound from
+/// the other kind of server. FreeRDP's own `freerdp_client_load_addins` registers both for the
+/// same reason; what it cannot do is name a subsystem, and both `freerdp_client_add_*_channel`
+/// calls are no-ops when the name is already present, so registering here first is what puts the
+/// argument in place rather than fighting with it.
+fn register_audio_channels(settings: *mut sys::rdpSettings) -> Result<(), Error> {
+    let name = CString::new("rdpsnd").expect("a literal with no NUL");
+    let params: [*const c_char; 2] = [name.as_ptr(), audio::SUBSYSTEM_ARG.as_ptr()];
+
+    // SAFETY: `settings` is live, `params` outlives both calls, and each copies what it needs.
+    let added = unsafe {
+        (
+            sys::freerdp_client_add_static_channel(settings, params.len(), params.as_ptr()),
+            sys::freerdp_client_add_dynamic_channel(settings, params.len(), params.as_ptr()),
+        )
+    };
+    if added.0 == 0 || added.1 == 0 {
+        return Err(Error::local("FreeRDP refused the rdpsnd channel"));
     }
     Ok(())
 }
@@ -1872,6 +1957,9 @@ mod tests {
         assert!(connect.clipboard);
         // Off, and the opposite of the clipboard on purpose — a resize renegotiates the session.
         assert!(!connect.resize);
+        // Also off: sound a caller never asked for is bandwidth it never asked for, and unlike
+        // the clipboard there is nowhere for it to go by default.
+        assert!(connect.audio.is_none());
 
         let keepalive = KeepAlive::default();
         assert_eq!(seconds(keepalive.idle), 10);
@@ -1896,6 +1984,35 @@ mod tests {
         assert_eq!(layout.DesktopScaleFactor, 200);
         assert_eq!(layout.DeviceScaleFactor, 100);
         assert_eq!(std::mem::size_of_val(&layout) as u32, sys::DISPLAY_CONTROL_MONITOR_LAYOUT_SIZE);
+    }
+
+    /// The `sys:` argument really reaches the settings, on both transports.
+    ///
+    /// This is the one assertion that separates working sound from silence, and it is worth a
+    /// test because the failure is invisible: with no subsystem named, `rdpsnd_process_connect`
+    /// walks its compiled-in backends, the last of which is `fake` — a device that accepts every
+    /// format and throws every buffer away. A session that lost this argument would negotiate
+    /// audio, report no error, log "Loaded fake backend for rdpsnd" at a level nobody reads, and
+    /// play nothing.
+    #[test]
+    fn the_audio_channel_names_this_crates_subsystem() {
+        // SAFETY: a standalone settings object, used and freed here; nothing else refers to it.
+        unsafe {
+            let settings = sys::freerdp_settings_new(0);
+            assert!(!settings.is_null());
+            register_audio_channels(settings).expect("FreeRDP refused the rdpsnd channel");
+
+            for found in [
+                sys::freerdp_static_channel_collection_find(settings, c"rdpsnd".as_ptr()),
+                sys::freerdp_dynamic_channel_collection_find(settings, c"rdpsnd".as_ptr()),
+            ] {
+                assert!(!found.is_null(), "rdpsnd was not registered");
+                assert_eq!((*found).argc, 2, "the channel was registered with no argument");
+                let arg = std::ffi::CStr::from_ptr(*(*found).argv.offset(1));
+                assert_eq!(arg, audio::SUBSYSTEM_ARG);
+            }
+            sys::freerdp_settings_free(settings);
+        }
     }
 
     /// A duration too large for FreeRDP's `UINT32` saturates rather than wrapping — a wrapped

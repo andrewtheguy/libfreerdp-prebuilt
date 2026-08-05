@@ -1,10 +1,10 @@
 //! A safe, **headless** RDP client over FreeRDP 3.
 //!
-//! Screen, cursor, keyboard, mouse, clipboard and resize, and nothing else. There is no window, no
-//! toolkit and no drawing: [`Session::start`] connects, keeps a complete framebuffer up to date
-//! in Rust-owned memory, and posts an [`Event`] whenever a rectangle of it changes. What the
-//! caller does with those pixels — encode them, diff them, throw them away — is not this crate's
-//! business.
+//! Screen, cursor, keyboard, mouse, clipboard, resize and sound, and nothing else. There is no
+//! window, no toolkit and no drawing: [`Session::start`] connects, keeps a complete framebuffer
+//! up to date in Rust-owned memory, and posts an [`Event`] whenever a rectangle of it changes.
+//! What the caller does with those pixels — encode them, diff them, throw them away — is not this
+//! crate's business, and the same goes for the PCM handed to an [`AudioSink`].
 //!
 //! ```no_run
 //! use freerdp::{Connect, Event, Session};
@@ -37,6 +37,8 @@
 //!         │  command queue + a WinPR event                  ▲
 //!         ▼                                                 │
 //!   the FreeRDP thread: WaitForMultipleObjects, then freerdp_check_event_handles
+//!         │
+//!         └─ AudioSink, called in place — sound never queues behind pixels
 //! ```
 //!
 //! [`Session::start`] takes an OS thread and never gives it back until the session ends. That is
@@ -55,7 +57,9 @@
 //!
 //! # What this does not do
 //!
-//! - **No audio.** The archives carry `rdpsnd`, and nothing here binds it.
+//! - **No microphone.** `rdpsnd` carries the remote's sound *out*; `audin` would carry a local
+//!   one in, and it is not built into the archives. A headless gateway has no microphone anyway —
+//!   whatever it forwarded would be somebody else's, over a link.
 //! - **No graphics pipeline.** `FreeRDP_SupportGraphicsPipeline` is set to `FALSE`, deliberately
 //!   and with a measurement behind it — see [`Connect`].
 //! - **No certificate verification.** Also deliberate, also documented on [`Connect`]. Read that
@@ -79,6 +83,7 @@
 //! changes that. If one session's fault must not take the host down, this crate has to run in its
 //! own process; that is a decision for the embedder, and this crate cannot make it.
 
+mod audio;
 mod clipboard;
 mod error;
 mod framebuffer;
@@ -86,6 +91,7 @@ mod input;
 mod pointer;
 mod session;
 
+pub use audio::{Audio, AudioFormat, AudioSink};
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardFormat};
 pub use error::Error;
 pub use framebuffer::{Frame, Framebuffer, Rect};
