@@ -50,9 +50,27 @@ case "$(uname -s)" in
   *)      deps="$(ldd "$bin" 2>/dev/null || true)" ;;
 esac
 
+# "Found nothing" is the answer these greps exist to give, so they accept exit 1 and nothing else:
+# exit 2 is grep saying it could not do the search, and a search that did not happen looks exactly
+# like a clean binary if its status is thrown away. Same rule as build.sh's `matches`.
+#
+# The answer goes into a global rather than out of a `$(…)`, because the failure has to be able to
+# end the *script*: an `exit` inside a command substitution ends only the subshell, so a check
+# written that way reports the grep it could not run as a binary with nothing wrong with it.
+matched=''
+find_deps() {
+  local status=0
+  matched="$(printf '%s\n' "$deps" | grep -iE "$1")" || status=$?
+  [ "$status" -le 1 ] || {
+    echo "   FAIL  grep failed ($status) looking for '$1' — the dependency is unknown, not absent" >&2
+    exit 1
+  }
+}
+
 # One pattern covering all four, because they fail for the same reason and a binary that got any
 # of them dynamically got them from somewhere this repository did not pin.
-if dynamic="$(printf '%s\n' "$deps" | grep -iE 'libfreerdp|libwinpr|libssl|libcrypto')" && [ -n "$dynamic" ]; then
+find_deps 'libfreerdp|libwinpr|libssl|libcrypto'
+if dynamic="$matched" && [ -n "$dynamic" ]; then
   echo "   FAIL  dynamic dependency on a library this repository ships statically:" >&2
   printf '           %s\n' "$dynamic" >&2
   fail=1
@@ -73,7 +91,8 @@ if [ -n "$manifest" ]; then
   cxx_runtime="$(sed -n 's/^cxx_runtime //p' "$manifest")"
   echo "   note  $(basename "$(dirname "$manifest")") MANIFEST says cxx_runtime: ${cxx_runtime:-<absent>}"
   if [ "$cxx_runtime" = "none" ]; then
-    if cxx_deps="$(printf '%s\n' "$deps" | grep -iE 'libstdc\+\+|libc\+\+')" && [ -n "$cxx_deps" ]; then
+    find_deps 'libstdc\+\+|libc\+\+'
+    if cxx_deps="$matched" && [ -n "$cxx_deps" ]; then
       echo "   FAIL  the archives need no C++ runtime, but the binary links one:" >&2
       printf '           %s\n' "$cxx_deps" >&2
       echo "         Nothing in this repository should emit -lstdc++/-lc++; check whether" >&2

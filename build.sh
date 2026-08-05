@@ -370,7 +370,10 @@ case "$target" in
     # that produced these is and `file` is a separate package.
     probe_member="$(mktemp -d)"
     for archive in "${archives[@]}"; do
-      member="$(ar t "$out/lib/$archive" | head -1)"
+      # The whole listing, then its first line. Not `ar t … | head -1`: `head` closes the pipe on
+      # the line it wanted, and under `pipefail` an `ar` that noticed gets the build blamed for it.
+      listing="$(ar t "$out/lib/$archive")"
+      member="${listing%%$'\n'*}"
       (cd "$probe_member" && ar x "$out/lib/$archive" "$member")
       readelf -h "$probe_member/$member" >/dev/null 2>&1 || {
         echo "$archive's members are not ELF objects — LTO is probably still on" >&2

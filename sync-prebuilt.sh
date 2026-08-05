@@ -11,7 +11,9 @@
 #
 #   include/{freerdp3,winpr3}/   FreeRDP's and WinPR's public headers. Text, and reviewable —
 #                                the opposite of a committed `.a`.
-#   src/bindings.rs              generated *from* those headers by gen-bindings.sh.
+#   src/bindings_apple.rs        generated *from* those headers by gen-bindings.sh — two files
+#   src/bindings_linux.rs        rather than one because `BOOL` is a byte on Apple and four off
+#                                it, and each is generated and checked on its own platform.
 #
 # **The headers come from a built artifact, not from the source tarball**, and that is a real
 # divergence from libvpx-prebuilt, which copies straight out of its checkout.

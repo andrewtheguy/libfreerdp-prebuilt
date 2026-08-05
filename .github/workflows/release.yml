@@ -195,9 +195,14 @@ jobs:
           depend on \`freerdp-prebuilt-sys\` instead; \`[lib] name = "freerdp_sys"\`, so the calls
           read \`freerdp_sys::freerdp_connect()\`.
 
-          Nothing needs pinning beyond the tag: \`build.rs\` fetches the archives for its target
-          from this repository's latest release, so a consuming project picks up new archives by
-          updating its git dependency and nothing else.
+          **The tag pins the source, not the archives.** \`build.rs\` fetches from
+          \`releases/latest\`, so a project pinned to this tag links the newest archives published
+          for the FreeRDP version this tag names — a later release of the same version replaces
+          them without the pin changing. That is deliberate: a rebuilt archive is how a build fix
+          reaches consumers, and the asset filename carries the version, so a release that moved
+          to a different FreeRDP 404s naming it rather than quietly handing back a library the
+          committed bindings do not describe. To pin the bytes too, build them yourself and set
+          \`FREERDP_PREBUILT_DIR\`.
 
           ## What is in the archives
 

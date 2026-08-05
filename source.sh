@@ -72,7 +72,10 @@ _fetch_verify_unpack() {
     # confusing failure rather than an obvious one.
     local inner
     inner="$(find "build/$dir.unpack" -mindepth 1 -maxdepth 1 -type d)"
-    [ "$(wc -l <<<"$inner")" -eq 1 ] || {
+    # Non-empty *and* one line. `wc -l` on nothing counts 1 here, because a here-string always ends
+    # in a newline — so a tarball that unpacked no directory at all otherwise passes this check and
+    # reaches `mv` with an empty source, which fails as a usage error naming neither tarball.
+    [ -n "$inner" ] && [ "$(wc -l <<<"$inner")" -eq 1 ] || {
       echo "$tarball does not hold exactly one top-level directory:" >&2
       printf '  %s\n' "$inner" >&2
       rm -rf "build/$dir.unpack"

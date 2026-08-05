@@ -246,6 +246,14 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // **The abort first, and it is not a duplicate of the command below.** `Command::Shutdown`
+        // is read by the event loop, and during startup there is no event loop to read it: the
+        // thread is inside `freerdp_connect`, in DNS, TCP, TLS or CredSSP, for as long as that
+        // takes. A session dropped there would leave this join waiting out the connect timeout —
+        // on whichever thread did the dropping, which for an embedder is the one running
+        // everything else. This is the same call the event loop makes when it *does* see the
+        // command, made from the other side, and it is why the join is bounded on both paths.
+        self.input.shared.abort_connect();
         self.input.push(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
             // Joined rather than detached. A detached FreeRDP thread outlives the handle that
@@ -281,10 +289,33 @@ impl Drop for Wake {
     }
 }
 
+/// The live context, or null once there is not one, and whether anybody has asked it to stop.
+///
+/// Separate from `Wake` because the guarantee is different: a `HANDLE` is internally synchronised
+/// and this is a pointer to memory that gets freed, so it is only ever touched under the mutex —
+/// which is what stops a caller aborting a connect on a context the session thread is freeing.
+///
+/// `aborted` is the other half, and it is not belt-and-braces: `Session::start` returns before the
+/// thread it spawned has built a context, so a session dropped immediately — which is exactly what
+/// a caller that changed its mind does — asks for an abort while there is nothing to abort. The
+/// *request* is what is kept here, and `abort_requested` is where an early one is honoured.
+/// (Measured: without it, dropping a session connecting to a black hole waited out the whole
+/// `connect_timeout` — 60 s of it — on the dropping thread.)
+struct ContextPtr {
+    ctx: *mut sys::rdpContext,
+    aborted: bool,
+}
+
+// SAFETY: the pointer is only dereferenced under `Shared::context`'s mutex, and the session thread
+// nulls it — under that same mutex — before `ContextGuard` frees the context. So no other thread
+// can hold it across the free.
+unsafe impl Send for ContextPtr {}
+
 /// What the caller's threads and the FreeRDP thread share.
 pub(crate) struct Shared {
     queue: Mutex<VecDeque<Command>>,
     wake: Wake,
+    context: Mutex<ContextPtr>,
     pub(crate) framebuffer: Framebuffer,
 }
 
@@ -299,8 +330,57 @@ impl Shared {
         Self {
             queue: Mutex::new(VecDeque::new()),
             wake: Wake(handle),
+            context: Mutex::new(ContextPtr { ctx: std::ptr::null_mut(), aborted: false }),
             framebuffer: Framebuffer::new(),
         }
+    }
+
+    /// Publish the context, so a caller's thread can abort a connect that has not finished.
+    ///
+    /// Called on the session thread as soon as the context exists, and withdrawn again before it
+    /// is freed. Between those two points, and only between them, `abort_connect` has something
+    /// to signal; before them there is `abort_requested`.
+    fn publish_context(&self, ctx: *mut sys::rdpContext) {
+        self.context().ctx = ctx;
+    }
+
+    /// Whether somebody has asked this session to stop.
+    ///
+    /// Read on the session thread immediately before `freerdp_connect`, because setting the abort
+    /// event earlier than that does nothing: `freerdp_connect` **resets** it as its first act
+    /// (`libfreerdp/core/freerdp.c:102`), so an abort that arrives before the connect starts is
+    /// erased by the connect it was meant to stop. The window that remains is between this read
+    /// and that reset — a few instructions with nothing blocking in them — and an abort landing
+    /// inside it is still caught by the queued `Command::Shutdown` once the connect returns.
+    fn abort_requested(&self) -> bool {
+        self.context().aborted
+    }
+
+    /// Withdraw it. Must happen before the context is freed, on the thread that frees it.
+    fn withdraw_context(&self) {
+        self.context().ctx = std::ptr::null_mut();
+    }
+
+    /// Unblock a connect in progress, from any thread.
+    ///
+    /// Records the request either way, and acts on it if there is a context yet. The lock is held
+    /// across the call, and the session thread must take the same lock to withdraw, so the context
+    /// cannot be freed while FreeRDP is inside this.
+    pub(crate) fn abort_connect(&self) {
+        let mut state = self.context();
+        state.aborted = true;
+        if !state.ctx.is_null() {
+            // SAFETY: the context is live for the duration of this lock, and
+            // `freerdp_abort_connect_context` is FreeRDP's own cross-thread cancellation — it
+            // signals an event rather than touching the connection.
+            unsafe { sys::freerdp_abort_connect_context(state.ctx) };
+        }
+    }
+
+    /// Poison is recovered for the same reason the queue's is: what is under this lock is one
+    /// pointer, and refusing to take it would mean a session that can no longer be stopped.
+    fn context(&self) -> std::sync::MutexGuard<'_, ContextPtr> {
+        self.context.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub(crate) fn push(&self, command: Command) {
@@ -424,6 +504,9 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
     // From here on every exit path must free the context, so the body is wrapped and the cleanup
     // is unconditional.
     let guard = ContextGuard(ctx);
+    // Published before anything can block: `apply_settings` and `freerdp_connect` are both ahead
+    // of the event loop, and a `Session` dropped while they run has nothing else to stop them.
+    shared.publish_context(ctx);
 
     let bridge = Box::into_raw(Box::new(Bridge {
         events: events.clone(),
@@ -438,7 +521,11 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
     // SAFETY: `ctx` is the context just created, so it is a `WrapperContext` with room for this.
     unsafe { (*(ctx as *mut WrapperContext)).bridge = bridge };
 
-    let result = run_connected(&config, ctx);
+    let result = run_connected(&config, ctx, shared);
+
+    // Withdrawn before the free, and that order is the whole of what makes `abort_connect` sound:
+    // after this returns, no other thread holds the pointer and none can take it again.
+    shared.withdraw_context();
 
     // SAFETY: the event loop has returned and no callback can fire after `freerdp_disconnect`
     // below, so nothing else can reach the bridge. Reclaimed exactly once.
@@ -465,7 +552,11 @@ impl Drop for ContextGuard {
     }
 }
 
-fn run_connected(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Error> {
+fn run_connected(
+    config: &Connect,
+    ctx: *mut sys::rdpContext,
+    shared: &Arc<Shared>,
+) -> Result<(), Error> {
     // SAFETY: `ctx` is live; `instance` and `settings` are set by `freerdp_client_context_new`.
     let instance = unsafe { (*ctx).instance };
     assert!(!instance.is_null(), "a context with no instance");
@@ -485,6 +576,14 @@ fn run_connected(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Erro
 
     apply_settings(config, ctx)?;
     subscribe_channels(ctx)?;
+
+    // Dropped before it ever connected — which is not rare, it is what a caller that changed its
+    // mind looks like — so there is nothing to connect *to* any more. Checked here rather than
+    // relied on through the abort event, because `freerdp_connect` clears that event on entry;
+    // see `Shared::abort_requested`.
+    if shared.abort_requested() {
+        return Err(Error::local("the session was ended before it connected"));
+    }
 
     // SAFETY: everything the connection needs is configured; this blocks until the RDP handshake
     // finishes or fails.
@@ -1646,8 +1745,12 @@ unsafe fn respond_with(cliprdr: *mut sys::CliprdrClientContext, data: Option<Vec
     // the bytes into the PDU rather than retaining the pointer.
     unsafe {
         let Some(send) = (*cliprdr).ClientFormatDataResponse else { return };
+        // The refusal is `None`, not emptiness. `Clipboard::respond(Some(vec![]))` is a caller
+        // saying "this format, and it is empty" — an empty selection, or text that really is zero
+        // bytes — and answering that with CB_RESPONSE_FAIL tells the peer the request could not be
+        // served, which is a different sentence and leaves whatever it had on its own clipboard.
+        let refused = data.is_none();
         let payload = data.unwrap_or_default();
-        let refused = payload.is_empty();
         let mut response: sys::CLIPRDR_FORMAT_DATA_RESPONSE = std::mem::zeroed();
         response.common.msgFlags =
             if refused { sys::CB_RESPONSE_FAIL as u16 } else { sys::CB_RESPONSE_OK as u16 };
@@ -1675,6 +1778,59 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(WrapperPointer, base), 0);
         assert!(std::mem::size_of::<WrapperPointer>() > std::mem::size_of::<sys::rdpPointer>());
+    }
+
+    /// Dropping a session that is still connecting returns promptly.
+    ///
+    /// The event loop is what reads `Command::Shutdown`, and during startup there is no event loop
+    /// — so before `Session::drop` aborted the connect, this join waited out the whole
+    /// `connect_timeout` on the caller's thread. Measured rather than reasoned, because the
+    /// difference between the two versions is entirely one of *time*.
+    ///
+    /// `10.255.255.1` is RFC 1918 space with nothing on it, chosen because a connect there hangs
+    /// rather than being refused. A network that refuses it anyway makes this pass for a different
+    /// reason, which is why the bound is 10 s against a 60 s timeout rather than something tight:
+    /// the test can be uninformative, but it cannot fail for being on the wrong network.
+    #[test]
+    fn dropping_a_connecting_session_does_not_wait_out_the_timeout() {
+        let started = std::time::Instant::now();
+        let (session, _events) = Session::start(Connect {
+            host: "10.255.255.1".into(),
+            port: 3389,
+            connect_timeout: Duration::from_secs(60),
+            ..Connect::default()
+        });
+        drop(session);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(10),
+            "dropping a connecting session took {took:?} — the abort did not reach freerdp_connect"
+        );
+    }
+
+    /// The same, for a drop that arrives once the connect is already in flight.
+    ///
+    /// A different mechanism from the test above and worth its own name: this one goes through
+    /// `freerdp_abort_connect_context` and the abort event that `freerdp_tcp_connect_timeout`
+    /// waits on beside the socket (`libfreerdp/core/tcp.c:836`), where the other never let the
+    /// connect start. A second of head start is what puts the thread inside that wait.
+    #[test]
+    fn dropping_a_session_mid_connect_does_not_wait_out_the_timeout() {
+        let (session, _events) = Session::start(Connect {
+            host: "10.255.255.1".into(),
+            port: 3389,
+            connect_timeout: Duration::from_secs(60),
+            ..Connect::default()
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        drop(session);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(10),
+            "dropping a session mid-connect took {took:?} — the abort event did not reach the \
+             connect's wait"
+        );
     }
 
     /// The default posture, stated as a test so that a change to it is a change to a file

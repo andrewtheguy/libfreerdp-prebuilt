@@ -26,6 +26,7 @@ use freerdp::{ClipboardEvent, ClipboardFormat, Connect, Event, Session};
 /// `CF_UNICODETEXT`, Windows' own id for plain text. Named here rather than imported
 /// because the engine crate deliberately carries format ids as plain numbers.
 const CF_UNICODETEXT: u32 = 13;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -117,7 +118,14 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let mut clipboard_ready = false;
 
     while Instant::now() < deadline {
-        let Ok(event) = events.recv_timeout(Duration::from_secs(5)) else { continue };
+        let event = match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            // A closed channel is not a quiet server, it is a gone one: the sender lives on the
+            // session thread, so this means that thread has ended. Treating it as a timeout would
+            // spin the deadline out and then blame whichever assertion below noticed first.
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match event {
             Event::Connected { width, height } => {
                 println!("connected       {width}x{height}");
@@ -237,7 +245,13 @@ fn resize_check(
     while Instant::now() < deadline {
         let event = match events.recv_timeout(Duration::from_secs(5)) {
             Ok(event) => event,
-            Err(_) => {
+            // The session thread always sends `Ended` before it drops the sender, and the arm
+            // below panics on that — so reaching here means it went without saying so, and asking
+            // a dead session to resize once every five seconds is not a better answer.
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("the event channel closed during the resize — the session thread is gone")
+            }
+            Err(RecvTimeoutError::Timeout) => {
                 // **Asking again is not belt-and-braces, it is the protocol.** A Windows 11 host
                 // ignores a monitor layout sent while it is still bringing the session up, and
                 // says nothing about having done so — measured here: the same 800x600 layout was

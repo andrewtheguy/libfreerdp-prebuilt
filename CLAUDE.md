@@ -63,8 +63,9 @@ is only the things that are easy to get wrong.
 `crates/freerdp-e2e` is the whole test:
 
 ```sh
-cargo run --release -p freerdp-e2e                        # no server needed
-cargo run --release -p freerdp-e2e -- <host> <user> <pw>   # connect, paint, disconnect
+cargo run --release -p freerdp-e2e                               # no server needed
+cargo run --release -p freerdp-e2e -- <host> <user> <pw>         # connect, paint, disconnect
+cargo run --release -p freerdp-e2e -- <host> <user> <pw> <port>  # …on a port other than 3389
 ```
 
 The second form is what proves the wrapper, and there is no substitute for it: connecting,

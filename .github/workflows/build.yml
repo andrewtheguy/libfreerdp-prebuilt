@@ -57,6 +57,15 @@ jobs:
             {"target":"linux-aarch64", "runs-on":"ubuntu-24.04-arm","group":"arm64"}
           ]'
           targets="$(jq -c --arg g "$GROUP" '[.[] | select($g == "all" or .group == $g)]' <<<"$all")"
+          # An unknown group selects nothing, and nothing is not a smaller build — it is a build
+          # that tested no target at all. `workflow_dispatch` cannot reach this (its input is a
+          # `choice`), but `workflow_call` takes a free string, so release.yml could ask for a
+          # group that does not exist and publish archives that nothing had built. Named here,
+          # while there is still a step to name it in.
+          [ "$(jq 'length' <<<"$targets")" -gt 0 ] || {
+            echo "::error::targets: '$GROUP' matches no target — expected all, x86_64 or arm64"
+            exit 1
+          }
           echo "$targets" | jq -r '.[].target' | sed 's/^/  /'
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
 
