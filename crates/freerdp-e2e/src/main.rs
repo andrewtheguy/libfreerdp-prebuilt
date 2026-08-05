@@ -21,12 +21,16 @@
 //!
 //! Exit code 0 means every check that ran passed. Anything else prints why.
 
-use freerdp::{ClipboardEvent, ClipboardFormat, Connect, Event, Session};
+use freerdp::{
+    Audio, AudioFormat, AudioSink, ClipboardEvent, ClipboardFormat, Connect, Event, Session,
+};
 
 /// `CF_UNICODETEXT`, Windows' own id for plain text. Named here rather than imported
 /// because the engine crate deliberately carries format ids as plain numbers.
 const CF_UNICODETEXT: u32 = 13;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -89,11 +93,60 @@ fn offline_checks() {
     println!("context         built, configured and torn down");
 }
 
+/// What the audio leg counts, from the FreeRDP thread.
+///
+/// Atomics rather than a channel because that is what an [`AudioSink`] is allowed to be: every
+/// method here runs on the thread decoding the desktop, and a sink that blocked would stop it.
+#[derive(Default)]
+struct Recorder {
+    /// How many of the server's formats this session accepted, `usize::MAX` until the channel
+    /// announced any — which is how "never negotiated" is told from "negotiated nothing".
+    accepted: AtomicUsize,
+    buffers: AtomicUsize,
+    bytes: AtomicUsize,
+    /// Wave buffers whose length was not a whole number of samples. Should be zero; anything else
+    /// means the bytes are not the PCM they were said to be.
+    ragged: AtomicUsize,
+}
+
+impl Recorder {
+    fn new() -> Self {
+        Self { accepted: AtomicUsize::new(usize::MAX), ..Self::default() }
+    }
+}
+
+impl AudioSink for Recorder {
+    fn negotiated(&self, accepted: usize) {
+        println!("rdpsnd          negotiated, {accepted} of the server's formats accepted");
+        self.accepted.store(accepted, Ordering::Relaxed);
+    }
+
+    fn opened(&self, format: AudioFormat) {
+        println!(
+            "rdpsnd          playing {} Hz, {} channel(s), {}-bit",
+            format.sample_rate, format.channels, format.bits_per_sample
+        );
+    }
+
+    fn wave(&self, samples: &[u8]) {
+        self.buffers.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(samples.len(), Ordering::Relaxed);
+        if !samples.len().is_multiple_of(AudioFormat::CD.block_align() as usize) {
+            self.ragged.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn closed(&self) {
+        println!("rdpsnd          the device closed");
+    }
+}
+
 /// The half that needs a server: connect, paint, disconnect.
 fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     println!();
     println!("connecting to {host}:{port} as {username}");
 
+    let recorder = Arc::new(Recorder::new());
     let (session, events) = Session::start(Connect {
         host: host.into(),
         port,
@@ -104,6 +157,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         // On for the resize leg below, and this is the only place in the repository that turns it
         // on — `Connect::resize` says why it is off by default.
         resize: true,
+        audio: Some(Audio { format: AudioFormat::CD, sink: recorder.clone() }),
         ..Connect::default()
     });
 
@@ -198,10 +252,63 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     session.input().key(0x1C, false, true);
     session.input().key(0x1C, false, false);
 
-    resize_check(&session, &events, resize_ready, width, height);
+    // The resize leg runs first because it is the long one, and the sound channel needs that time:
+    // `rdpsnd` comes up after the first paints, and a desktop has to make a noise before there is
+    // anything to count. But its verdict is *held* rather than thrown, so that a host which
+    // ignores layouts — which is a fact about the host, and a known one — does not swallow the
+    // audio report on the way out.
+    let resize_failure = resize_check(&session, &events, resize_ready, width, height);
+    audio_check(&recorder);
+    if let Some(why) = resize_failure {
+        panic!("{why}");
+    }
 
     session.shutdown();
     println!("disconnected    cleanly");
+}
+
+/// What the sound channel did, and what can honestly be asserted about it.
+///
+/// Two of the three parts are the server's to decide, so they are reported rather than asserted:
+/// whether `rdpsnd` is offered at all, and whether the remote made a noise while this ran. A
+/// desktop sitting at a login screen plays nothing, and failing a build of the archives over that
+/// would be a claim about the wrong thing — the same reasoning as the resize and clipboard legs.
+///
+/// What *is* asserted belongs to this crate. If the channel came up, this crate's device was the
+/// one loaded rather than FreeRDP's `fake`, which discards every buffer — and the way to know is
+/// that `negotiated` fired at all, since `fake` never calls it. And if any wave arrived, every
+/// buffer must be a whole number of samples in the format that was asked for.
+///
+/// **To exercise the part that only ears can settle**, run this against a host and make it play
+/// something while it connects.
+fn audio_check(recorder: &Recorder) {
+    let accepted = recorder.accepted.load(Ordering::Relaxed);
+    if accepted == usize::MAX {
+        println!("rdpsnd          not offered by this server");
+        return;
+    }
+    assert_eq!(
+        accepted, 1,
+        "the server offered rdpsnd but nothing in 44.1 kHz 16-bit stereo PCM, which MS-RDPEA \
+         requires both ends to support"
+    );
+
+    let buffers = recorder.buffers.load(Ordering::Relaxed);
+    let bytes = recorder.bytes.load(Ordering::Relaxed);
+    if buffers == 0 {
+        println!("rdpsnd          negotiated, but this desktop played nothing while we watched");
+        return;
+    }
+    assert_eq!(
+        recorder.ragged.load(Ordering::Relaxed),
+        0,
+        "{buffers} wave buffers arrived and some were not a whole number of 4-byte samples — \
+         these bytes are not the PCM the format says they are"
+    );
+    println!(
+        "rdpsnd          {buffers} wave buffers, {bytes} bytes, {:.2}s of sound",
+        bytes as f64 / f64::from(AudioFormat::CD.byte_rate())
+    );
 }
 
 /// Ask for a different desktop size, and see whether one arrives.
@@ -213,13 +320,17 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
 /// that belongs to this crate: if the server said it would listen, a resize must produce a
 /// framebuffer of the new size. A server that never offered the channel is reported and skipped,
 /// the same way the offline half reports what a macOS runner cannot do.
+///
+/// A failure comes back as a sentence rather than a panic so that the audio leg is still reported
+/// on the way out — see the call site. Everything below that *is* an invariant of this crate
+/// rather than of the server still panics where it is found.
 fn resize_check(
     session: &Session,
     events: &std::sync::mpsc::Receiver<Event>,
     ready: bool,
     width: u32,
     height: u32,
-) {
+) -> Option<String> {
     // Sent before knowing whether the channel is up, on purpose. The paint loop above stops after
     // five rectangles, which may well be before the display-control capabilities have arrived, so
     // reading its `ready` flag as final would skip this check on a race rather than on a fact. The
@@ -249,7 +360,10 @@ fn resize_check(
             // below panics on that — so reaching here means it went without saying so, and asking
             // a dead session to resize once every five seconds is not a better answer.
             Err(RecvTimeoutError::Disconnected) => {
-                panic!("the event channel closed during the resize — the session thread is gone")
+                return Some(
+                    "the event channel closed during the resize — the session thread is gone"
+                        .into(),
+                )
             }
             Err(RecvTimeoutError::Timeout) => {
                 // **Asking again is not belt-and-braces, it is the protocol.** A Windows 11 host
@@ -288,18 +402,22 @@ fn resize_check(
                     (0, 0),
                     "a resize to nothing is not a resize"
                 );
-                return;
+                return None;
             }
-            Event::Ended(result) => panic!("the session ended during the resize: {result:?}"),
+            Event::Ended(result) => {
+                return Some(format!("the session ended during the resize: {result:?}"))
+            }
             _ => {}
         }
     }
 
-    assert!(
-        !ready,
-        "the server offered DisplayControl and then ignored a layout for \
-         {want_width}x{want_height} at {want_scale}% — the desktop is still {width}x{height} \
-         after 45 s"
-    );
+    if ready {
+        return Some(format!(
+            "the server offered DisplayControl and then ignored a layout for \
+             {want_width}x{want_height} at {want_scale}% — the desktop is still {width}x{height} \
+             after 45 s"
+        ));
+    }
     println!("resize          skipped — this server does not offer DisplayControl");
+    None
 }

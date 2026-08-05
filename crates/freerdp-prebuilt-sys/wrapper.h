@@ -5,14 +5,14 @@
 // options that are OFF. Including them all would put a surface in bindings.rs that no consumer
 // can call and that every consumer would have to keep compiling.
 //
-// What is here is the headless-embedder surface, plus the two channels the wrapper crate binds:
+// What is here is the headless-embedder surface, plus the channels the wrapper crate binds:
 // connect and drive the event loop, receive paint and pointer updates through the GDI, send
-// input, and exchange clipboard formats.
+// input, exchange clipboard formats, and receive redirected sound.
 //
-// `disp.h` and `rdpgfx.h` are included though nothing calls them yet, and that is deliberate
-// rather than sloppy: the archives carry those channels (see build.sh's note on tables.c being
-// generated at configure time), so the declarations should be reachable from the same release
-// rather than requiring a regeneration when resize and the graphics pipeline are picked up.
+// `rdpgfx.h` is included though nothing calls it yet, and that is deliberate rather than sloppy:
+// the archives carry that channel (see build.sh's note on tables.c being generated at configure
+// time), so the declarations should be reachable from the same release rather than requiring a
+// regeneration when the graphics pipeline is picked up.
 
 // The connection, its settings, and the client entry points that build a context around it.
 #include <freerdp/freerdp.h>
@@ -45,9 +45,16 @@
 #include <freerdp/scancode.h>
 #include <winpr/input.h>
 
-// Channels: the loader, and the two client interfaces bound in a ChannelConnected handler.
+// Channels: the loader, and the client interfaces bound in a ChannelConnected handler.
 #include <freerdp/channels/channels.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/disp.h>
 #include <freerdp/client/rdpgfx.h>
+
+// Sound, which arrives through neither of those routes. `rdpsnd` has no client context to
+// subscribe to: it loads a *device* — the thing an ordinary client points at ALSA or CoreAudio —
+// and this crate's device is Rust. `rdpsnd.h` is that interface, and `audio.h` is the
+// `AUDIO_FORMAT` it negotiates in.
+#include <freerdp/client/rdpsnd.h>
+#include <freerdp/codec/audio.h>

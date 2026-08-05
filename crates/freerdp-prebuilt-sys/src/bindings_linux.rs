@@ -6071,6 +6071,138 @@ pub const DISPLAY_CONTROL_MIN_PHYSICAL_MONITOR_WIDTH: u32 = 10;
 pub const DISPLAY_CONTROL_MAX_PHYSICAL_MONITOR_WIDTH: u32 = 10000;
 pub const DISPLAY_CONTROL_MIN_PHYSICAL_MONITOR_HEIGHT: u32 = 10;
 pub const DISPLAY_CONTROL_MAX_PHYSICAL_MONITOR_HEIGHT: u32 = 10000;
+pub const SNDC_CLOSE: u32 = 1;
+pub const SNDC_WAVE: u32 = 2;
+pub const SNDC_SETVOLUME: u32 = 3;
+pub const SNDC_SETPITCH: u32 = 4;
+pub const SNDC_WAVECONFIRM: u32 = 5;
+pub const SNDC_TRAINING: u32 = 6;
+pub const SNDC_FORMATS: u32 = 7;
+pub const SNDC_CRYPTKEY: u32 = 8;
+pub const SNDC_WAVEENCRYPT: u32 = 9;
+pub const SNDC_UDPWAVE: u32 = 10;
+pub const SNDC_UDPWAVELAST: u32 = 11;
+pub const SNDC_QUALITYMODE: u32 = 12;
+pub const SNDC_WAVE2: u32 = 13;
+pub const TSSNDCAPS_ALIVE: u32 = 1;
+pub const TSSNDCAPS_VOLUME: u32 = 2;
+pub const TSSNDCAPS_PITCH: u32 = 4;
+pub const DYNAMIC_QUALITY: u32 = 0;
+pub const MEDIUM_QUALITY: u32 = 1;
+pub const HIGH_QUALITY: u32 = 2;
+pub const WAVE_FORMAT_UNKNOWN: u32 = 0;
+pub const WAVE_FORMAT_PCM: u32 = 1;
+pub const WAVE_FORMAT_ADPCM: u32 = 2;
+pub const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
+pub const WAVE_FORMAT_VSELP: u32 = 4;
+pub const WAVE_FORMAT_IBM_CVSD: u32 = 5;
+pub const WAVE_FORMAT_ALAW: u32 = 6;
+pub const WAVE_FORMAT_MULAW: u32 = 7;
+pub const WAVE_FORMAT_OKI_ADPCM: u32 = 16;
+pub const WAVE_FORMAT_DVI_ADPCM: u32 = 17;
+pub const WAVE_FORMAT_MEDIASPACE_ADPCM: u32 = 18;
+pub const WAVE_FORMAT_SIERRA_ADPCM: u32 = 19;
+pub const WAVE_FORMAT_G723_ADPCM: u32 = 20;
+pub const WAVE_FORMAT_DIGISTD: u32 = 21;
+pub const WAVE_FORMAT_DIGIFIX: u32 = 22;
+pub const WAVE_FORMAT_DIALOGIC_OKI_ADPCM: u32 = 23;
+pub const WAVE_FORMAT_MEDIAVISION_ADPCM: u32 = 24;
+pub const WAVE_FORMAT_CU_CODEC: u32 = 25;
+pub const WAVE_FORMAT_YAMAHA_ADPCM: u32 = 32;
+pub const WAVE_FORMAT_SONARC: u32 = 33;
+pub const WAVE_FORMAT_DSPGROUP_TRUESPEECH: u32 = 34;
+pub const WAVE_FORMAT_ECHOSC1: u32 = 35;
+pub const WAVE_FORMAT_AUDIOFILE_AF36: u32 = 36;
+pub const WAVE_FORMAT_APTX: u32 = 37;
+pub const WAVE_FORMAT_AUDIOFILE_AF10: u32 = 38;
+pub const WAVE_FORMAT_PROSODY_1612: u32 = 39;
+pub const WAVE_FORMAT_LRC: u32 = 40;
+pub const WAVE_FORMAT_DOLBY_AC2: u32 = 48;
+pub const WAVE_FORMAT_GSM610: u32 = 49;
+pub const WAVE_FORMAT_MSNAUDIO: u32 = 50;
+pub const WAVE_FORMAT_ANTEX_ADPCME: u32 = 51;
+pub const WAVE_FORMAT_CONTROL_RES_VQLPC: u32 = 52;
+pub const WAVE_FORMAT_DIGIREAL: u32 = 53;
+pub const WAVE_FORMAT_DIGIADPCM: u32 = 54;
+pub const WAVE_FORMAT_CONTROL_RES_CR10: u32 = 55;
+pub const WAVE_FORMAT_NMS_VBXADPCM: u32 = 56;
+pub const WAVE_FORMAT_ROLAND_RDAC: u32 = 57;
+pub const WAVE_FORMAT_ECHOSC3: u32 = 58;
+pub const WAVE_FORMAT_ROCKWELL_ADPCM: u32 = 59;
+pub const WAVE_FORMAT_ROCKWELL_DIGITALK: u32 = 60;
+pub const WAVE_FORMAT_XEBEC: u32 = 61;
+pub const WAVE_FORMAT_G721_ADPCM: u32 = 64;
+pub const WAVE_FORMAT_G728_CELP: u32 = 65;
+pub const WAVE_FORMAT_MSG723: u32 = 66;
+pub const WAVE_FORMAT_MPEG: u32 = 80;
+pub const WAVE_FORMAT_RT24: u32 = 82;
+pub const WAVE_FORMAT_PAC: u32 = 83;
+pub const WAVE_FORMAT_MPEGLAYER3: u32 = 85;
+pub const WAVE_FORMAT_LUCENT_G723: u32 = 89;
+pub const WAVE_FORMAT_CIRRUS: u32 = 96;
+pub const WAVE_FORMAT_ESPCM: u32 = 97;
+pub const WAVE_FORMAT_VOXWARE: u32 = 98;
+pub const WAVE_FORMAT_CANOPUS_ATRAC: u32 = 99;
+pub const WAVE_FORMAT_G726_ADPCM: u32 = 100;
+pub const WAVE_FORMAT_G722_ADPCM: u32 = 101;
+pub const WAVE_FORMAT_DSAT: u32 = 102;
+pub const WAVE_FORMAT_DSAT_DISPLAY: u32 = 103;
+pub const WAVE_FORMAT_VOXWARE_BYTE_ALIGNED: u32 = 105;
+pub const WAVE_FORMAT_VOXWARE_AC8: u32 = 112;
+pub const WAVE_FORMAT_VOXWARE_AC10: u32 = 113;
+pub const WAVE_FORMAT_VOXWARE_AC16: u32 = 114;
+pub const WAVE_FORMAT_VOXWARE_AC20: u32 = 115;
+pub const WAVE_FORMAT_VOXWARE_RT24: u32 = 116;
+pub const WAVE_FORMAT_VOXWARE_RT29: u32 = 117;
+pub const WAVE_FORMAT_VOXWARE_RT29HW: u32 = 118;
+pub const WAVE_FORMAT_VOXWARE_VR12: u32 = 119;
+pub const WAVE_FORMAT_VOXWARE_VR18: u32 = 120;
+pub const WAVE_FORMAT_VOXWARE_TQ40: u32 = 121;
+pub const WAVE_FORMAT_SOFTSOUND: u32 = 128;
+pub const WAVE_FORMAT_VOXWARE_TQ60: u32 = 129;
+pub const WAVE_FORMAT_MSRT24: u32 = 130;
+pub const WAVE_FORMAT_G729A: u32 = 131;
+pub const WAVE_FORMAT_MVI_MV12: u32 = 132;
+pub const WAVE_FORMAT_DF_G726: u32 = 133;
+pub const WAVE_FORMAT_DF_GSM610: u32 = 134;
+pub const WAVE_FORMAT_ISIAUDIO: u32 = 136;
+pub const WAVE_FORMAT_ONLIVE: u32 = 137;
+pub const WAVE_FORMAT_SBC24: u32 = 145;
+pub const WAVE_FORMAT_DOLBY_AC3_SPDIF: u32 = 146;
+pub const WAVE_FORMAT_ZYXEL_ADPCM: u32 = 151;
+pub const WAVE_FORMAT_PHILIPS_LPCBB: u32 = 152;
+pub const WAVE_FORMAT_PACKED: u32 = 153;
+pub const WAVE_FORMAT_RHETOREX_ADPCM: u32 = 256;
+pub const WAVE_FORMAT_IRAT: u32 = 257;
+pub const WAVE_FORMAT_VIVO_G723: u32 = 273;
+pub const WAVE_FORMAT_VIVO_SIREN: u32 = 274;
+pub const WAVE_FORMAT_DIGITAL_G723: u32 = 291;
+pub const WAVE_FORMAT_WMAUDIO2: u32 = 353;
+pub const WAVE_FORMAT_WMAUDIO3: u32 = 354;
+pub const WAVE_FORMAT_WMAUDIO_LOSSLESS: u32 = 355;
+pub const WAVE_FORMAT_CREATIVE_ADPCM: u32 = 512;
+pub const WAVE_FORMAT_CREATIVE_FASTSPEECH8: u32 = 514;
+pub const WAVE_FORMAT_CREATIVE_FASTSPEECH10: u32 = 515;
+pub const WAVE_FORMAT_QUARTERDECK: u32 = 544;
+pub const WAVE_FORMAT_FM_TOWNS_SND: u32 = 768;
+pub const WAVE_FORMAT_BTV_DIGITAL: u32 = 1024;
+pub const WAVE_FORMAT_VME_VMPCM: u32 = 1664;
+pub const WAVE_FORMAT_OLIGSM: u32 = 4096;
+pub const WAVE_FORMAT_OLIADPCM: u32 = 4097;
+pub const WAVE_FORMAT_OLICELP: u32 = 4098;
+pub const WAVE_FORMAT_OLISBC: u32 = 4099;
+pub const WAVE_FORMAT_OLIOPR: u32 = 4100;
+pub const WAVE_FORMAT_LH_CODEC: u32 = 4352;
+pub const WAVE_FORMAT_NORRIS: u32 = 5120;
+pub const WAVE_FORMAT_SOUNDSPACE_MUSICOMPRESS: u32 = 5376;
+pub const WAVE_FORMAT_DVM: u32 = 8192;
+pub const WAVE_FORMAT_OPUS: u32 = 28751;
+pub const WAVE_FORMAT_AAC_MS: u32 = 41222;
+pub const WAVE_FORMAT_EXTENSIBLE: u32 = 65534;
+pub const RDPSND_CHANNEL_NAME: &[u8; 7] = b"rdpsnd\0";
+pub const RDPSND_DVC_CHANNEL_NAME: &[u8; 19] = b"AUDIO_PLAYBACK_DVC\0";
+pub const RDPSND_LOSSY_DVC_CHANNEL_NAME: &[u8; 25] = b"AUDIO_PLAYBACK_LOSSY_DVC\0";
+pub const RDPSND_DEVICE_EXPORT_FUNC_NAME: &[u8; 38] = b"freerdp_rdpsnd_client_subsystem_entry\0";
 pub type __off_t = ::std::os::raw::c_long;
 pub type __off64_t = ::std::os::raw::c_long;
 extern "C" {
@@ -30220,3 +30352,203 @@ const _: () = {
     ["Offset of field: s_disp_client_context::SendMonitorLayout"]
         [::std::mem::offset_of!(s_disp_client_context, SendMonitorLayout) - 24usize];
 };
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AUDIO_FORMAT {
+    pub wFormatTag: UINT16,
+    pub nChannels: UINT16,
+    pub nSamplesPerSec: UINT32,
+    pub nAvgBytesPerSec: UINT32,
+    pub nBlockAlign: UINT16,
+    pub wBitsPerSample: UINT16,
+    pub cbSize: UINT16,
+    pub data: *mut BYTE,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of AUDIO_FORMAT"][::std::mem::size_of::<AUDIO_FORMAT>() - 32usize];
+    ["Alignment of AUDIO_FORMAT"][::std::mem::align_of::<AUDIO_FORMAT>() - 8usize];
+    ["Offset of field: AUDIO_FORMAT::wFormatTag"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, wFormatTag) - 0usize];
+    ["Offset of field: AUDIO_FORMAT::nChannels"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, nChannels) - 2usize];
+    ["Offset of field: AUDIO_FORMAT::nSamplesPerSec"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, nSamplesPerSec) - 4usize];
+    ["Offset of field: AUDIO_FORMAT::nAvgBytesPerSec"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, nAvgBytesPerSec) - 8usize];
+    ["Offset of field: AUDIO_FORMAT::nBlockAlign"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, nBlockAlign) - 12usize];
+    ["Offset of field: AUDIO_FORMAT::wBitsPerSample"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, wBitsPerSample) - 14usize];
+    ["Offset of field: AUDIO_FORMAT::cbSize"]
+        [::std::mem::offset_of!(AUDIO_FORMAT, cbSize) - 16usize];
+    ["Offset of field: AUDIO_FORMAT::data"][::std::mem::offset_of!(AUDIO_FORMAT, data) - 24usize];
+};
+extern "C" {
+    pub fn audio_format_compute_time_length(format: *const AUDIO_FORMAT, size: usize) -> UINT32;
+}
+extern "C" {
+    pub fn audio_format_get_tag_string(wFormatTag: UINT16) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+    pub fn audio_format_print(log: *mut wLog, level: DWORD, format: *const AUDIO_FORMAT);
+}
+extern "C" {
+    pub fn audio_formats_print(
+        log: *mut wLog,
+        level: DWORD,
+        formats: *const AUDIO_FORMAT,
+        count: UINT16,
+    );
+}
+extern "C" {
+    pub fn audio_format_read(s: *mut wStream, format: *mut AUDIO_FORMAT) -> BOOL;
+}
+extern "C" {
+    pub fn audio_format_write(s: *mut wStream, format: *const AUDIO_FORMAT) -> BOOL;
+}
+extern "C" {
+    pub fn audio_format_copy(srcFormat: *const AUDIO_FORMAT, dstFormat: *mut AUDIO_FORMAT) -> BOOL;
+}
+extern "C" {
+    pub fn audio_format_compatible(with: *const AUDIO_FORMAT, what: *const AUDIO_FORMAT) -> BOOL;
+}
+extern "C" {
+    pub fn audio_format_free(format: *mut AUDIO_FORMAT);
+}
+extern "C" {
+    pub fn audio_formats_free(formats: *mut AUDIO_FORMAT, count: usize);
+}
+extern "C" {
+    pub fn audio_format_new() -> *mut AUDIO_FORMAT;
+}
+extern "C" {
+    pub fn audio_formats_new(count: usize) -> *mut AUDIO_FORMAT;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rdpsnd_plugin {
+    _unused: [u8; 0],
+}
+pub type rdpsndPlugin = rdpsnd_plugin;
+pub type rdpsndDevicePlugin = rdpsnd_device_plugin;
+pub type pcFormatSupported = ::std::option::Option<
+    unsafe extern "C" fn(device: *mut rdpsndDevicePlugin, format: *const AUDIO_FORMAT) -> BOOL,
+>;
+pub type pcOpen = ::std::option::Option<
+    unsafe extern "C" fn(
+        device: *mut rdpsndDevicePlugin,
+        format: *const AUDIO_FORMAT,
+        latency: UINT32,
+    ) -> BOOL,
+>;
+pub type pcGetVolume =
+    ::std::option::Option<unsafe extern "C" fn(device: *mut rdpsndDevicePlugin) -> UINT32>;
+pub type pcSetVolume = ::std::option::Option<
+    unsafe extern "C" fn(device: *mut rdpsndDevicePlugin, value: UINT32) -> BOOL,
+>;
+pub type pcPlay = ::std::option::Option<
+    unsafe extern "C" fn(device: *mut rdpsndDevicePlugin, data: *const BYTE, size: usize) -> UINT,
+>;
+pub type pcPlayEx = ::std::option::Option<
+    unsafe extern "C" fn(
+        device: *mut rdpsndDevicePlugin,
+        format: *const AUDIO_FORMAT,
+        data: *const BYTE,
+        size: usize,
+    ) -> UINT,
+>;
+pub type pcStart = ::std::option::Option<unsafe extern "C" fn(device: *mut rdpsndDevicePlugin)>;
+pub type pcClose = ::std::option::Option<unsafe extern "C" fn(device: *mut rdpsndDevicePlugin)>;
+pub type pcFree = ::std::option::Option<unsafe extern "C" fn(device: *mut rdpsndDevicePlugin)>;
+pub type pcDefaultFormat = ::std::option::Option<
+    unsafe extern "C" fn(
+        device: *mut rdpsndDevicePlugin,
+        desired: *const AUDIO_FORMAT,
+        defaultFormat: *mut AUDIO_FORMAT,
+    ) -> BOOL,
+>;
+pub type pcServerFormatAnnounce = ::std::option::Option<
+    unsafe extern "C" fn(
+        device: *mut rdpsndDevicePlugin,
+        formats: *const AUDIO_FORMAT,
+        count: usize,
+    ) -> UINT,
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rdpsnd_device_plugin {
+    pub rdpsnd: *mut rdpsndPlugin,
+    pub FormatSupported: pcFormatSupported,
+    pub Open: pcOpen,
+    pub GetVolume: pcGetVolume,
+    pub SetVolume: pcSetVolume,
+    pub Play: pcPlay,
+    pub Start: pcStart,
+    pub Close: pcClose,
+    pub Free: pcFree,
+    pub DefaultFormat: pcDefaultFormat,
+    pub ServerFormatAnnounce: pcServerFormatAnnounce,
+    pub PlayEx: pcPlayEx,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of rdpsnd_device_plugin"][::std::mem::size_of::<rdpsnd_device_plugin>() - 96usize];
+    ["Alignment of rdpsnd_device_plugin"][::std::mem::align_of::<rdpsnd_device_plugin>() - 8usize];
+    ["Offset of field: rdpsnd_device_plugin::rdpsnd"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, rdpsnd) - 0usize];
+    ["Offset of field: rdpsnd_device_plugin::FormatSupported"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, FormatSupported) - 8usize];
+    ["Offset of field: rdpsnd_device_plugin::Open"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, Open) - 16usize];
+    ["Offset of field: rdpsnd_device_plugin::GetVolume"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, GetVolume) - 24usize];
+    ["Offset of field: rdpsnd_device_plugin::SetVolume"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, SetVolume) - 32usize];
+    ["Offset of field: rdpsnd_device_plugin::Play"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, Play) - 40usize];
+    ["Offset of field: rdpsnd_device_plugin::Start"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, Start) - 48usize];
+    ["Offset of field: rdpsnd_device_plugin::Close"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, Close) - 56usize];
+    ["Offset of field: rdpsnd_device_plugin::Free"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, Free) - 64usize];
+    ["Offset of field: rdpsnd_device_plugin::DefaultFormat"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, DefaultFormat) - 72usize];
+    ["Offset of field: rdpsnd_device_plugin::ServerFormatAnnounce"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, ServerFormatAnnounce) - 80usize];
+    ["Offset of field: rdpsnd_device_plugin::PlayEx"]
+        [::std::mem::offset_of!(rdpsnd_device_plugin, PlayEx) - 88usize];
+};
+pub type PREGISTERRDPSNDDEVICE = ::std::option::Option<
+    unsafe extern "C" fn(rdpsnd: *mut rdpsndPlugin, device: *mut rdpsndDevicePlugin),
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct FREERDP_RDPSND_DEVICE_ENTRY_POINTS {
+    pub rdpsnd: *mut rdpsndPlugin,
+    pub pRegisterRdpsndDevice: PREGISTERRDPSNDDEVICE,
+    pub args: *const ADDIN_ARGV,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of FREERDP_RDPSND_DEVICE_ENTRY_POINTS"]
+        [::std::mem::size_of::<FREERDP_RDPSND_DEVICE_ENTRY_POINTS>() - 24usize];
+    ["Alignment of FREERDP_RDPSND_DEVICE_ENTRY_POINTS"]
+        [::std::mem::align_of::<FREERDP_RDPSND_DEVICE_ENTRY_POINTS>() - 8usize];
+    ["Offset of field: FREERDP_RDPSND_DEVICE_ENTRY_POINTS::rdpsnd"]
+        [::std::mem::offset_of!(FREERDP_RDPSND_DEVICE_ENTRY_POINTS, rdpsnd) - 0usize];
+    ["Offset of field: FREERDP_RDPSND_DEVICE_ENTRY_POINTS::pRegisterRdpsndDevice"][::std::mem::offset_of!(
+        FREERDP_RDPSND_DEVICE_ENTRY_POINTS,
+        pRegisterRdpsndDevice
+    ) - 8usize];
+    ["Offset of field: FREERDP_RDPSND_DEVICE_ENTRY_POINTS::args"]
+        [::std::mem::offset_of!(FREERDP_RDPSND_DEVICE_ENTRY_POINTS, args) - 16usize];
+};
+pub type PFREERDP_RDPSND_DEVICE_ENTRY_POINTS = *mut FREERDP_RDPSND_DEVICE_ENTRY_POINTS;
+pub type PFREERDP_RDPSND_DEVICE_ENTRY = ::std::option::Option<
+    unsafe extern "C" fn(pEntryPoints: PFREERDP_RDPSND_DEVICE_ENTRY_POINTS) -> UINT,
+>;
+extern "C" {
+    pub fn freerdp_rdpsnd_get_context(plugin: *mut rdpsndPlugin) -> *mut rdpContext;
+}
