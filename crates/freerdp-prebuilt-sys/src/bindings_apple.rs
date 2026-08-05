@@ -11,6 +11,13 @@
 // `--allowlist-file` restricts this to items declared by FreeRDP's and WinPR's
 // own installed headers. Without it the output also carries whatever the
 // generating machine's libc declares, which is one platform's idea of it.
+//
+// The allowlist is not quite enough on its own: a type is emitted if an allowlisted
+// *signature* reaches it, whatever header declared it. Two WinPR functions take a
+// `FILE*`, which dragged glibc's `_IO_FILE` in — a struct whose layout differs
+// between one distribution's glibc and another's, so the committed file was only
+// valid on the machine that made it. Both functions are blocklisted; nothing in
+// this repository calls them, and a caller that wants one can use libc's own.
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 #![allow(clippy::all)]
 
@@ -6075,94 +6082,6 @@ extern "C" {
 }
 pub type va_list = __builtin_va_list;
 pub type fpos_t = __darwin_off_t;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct __sbuf {
-    pub _base: *mut ::std::os::raw::c_uchar,
-    pub _size: ::std::os::raw::c_int,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of __sbuf"][::std::mem::size_of::<__sbuf>() - 16usize];
-    ["Alignment of __sbuf"][::std::mem::align_of::<__sbuf>() - 8usize];
-    ["Offset of field: __sbuf::_base"][::std::mem::offset_of!(__sbuf, _base) - 0usize];
-    ["Offset of field: __sbuf::_size"][::std::mem::offset_of!(__sbuf, _size) - 8usize];
-};
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct __sFILEX {
-    _unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct __sFILE {
-    pub _p: *mut ::std::os::raw::c_uchar,
-    pub _r: ::std::os::raw::c_int,
-    pub _w: ::std::os::raw::c_int,
-    pub _flags: ::std::os::raw::c_short,
-    pub _file: ::std::os::raw::c_short,
-    pub _bf: __sbuf,
-    pub _lbfsize: ::std::os::raw::c_int,
-    pub _cookie: *mut ::std::os::raw::c_void,
-    pub _close: ::std::option::Option<
-        unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int,
-    >,
-    pub _read: ::std::option::Option<
-        unsafe extern "C" fn(
-            arg1: *mut ::std::os::raw::c_void,
-            arg2: *mut ::std::os::raw::c_char,
-            __n: ::std::os::raw::c_int,
-        ) -> ::std::os::raw::c_int,
-    >,
-    pub _seek: ::std::option::Option<
-        unsafe extern "C" fn(
-            arg1: *mut ::std::os::raw::c_void,
-            arg2: fpos_t,
-            arg3: ::std::os::raw::c_int,
-        ) -> fpos_t,
-    >,
-    pub _write: ::std::option::Option<
-        unsafe extern "C" fn(
-            arg1: *mut ::std::os::raw::c_void,
-            arg2: *const ::std::os::raw::c_char,
-            __n: ::std::os::raw::c_int,
-        ) -> ::std::os::raw::c_int,
-    >,
-    pub _ub: __sbuf,
-    pub _extra: *mut __sFILEX,
-    pub _ur: ::std::os::raw::c_int,
-    pub _ubuf: [::std::os::raw::c_uchar; 3usize],
-    pub _nbuf: [::std::os::raw::c_uchar; 1usize],
-    pub _lb: __sbuf,
-    pub _blksize: ::std::os::raw::c_int,
-    pub _offset: fpos_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of __sFILE"][::std::mem::size_of::<__sFILE>() - 152usize];
-    ["Alignment of __sFILE"][::std::mem::align_of::<__sFILE>() - 8usize];
-    ["Offset of field: __sFILE::_p"][::std::mem::offset_of!(__sFILE, _p) - 0usize];
-    ["Offset of field: __sFILE::_r"][::std::mem::offset_of!(__sFILE, _r) - 8usize];
-    ["Offset of field: __sFILE::_w"][::std::mem::offset_of!(__sFILE, _w) - 12usize];
-    ["Offset of field: __sFILE::_flags"][::std::mem::offset_of!(__sFILE, _flags) - 16usize];
-    ["Offset of field: __sFILE::_file"][::std::mem::offset_of!(__sFILE, _file) - 18usize];
-    ["Offset of field: __sFILE::_bf"][::std::mem::offset_of!(__sFILE, _bf) - 24usize];
-    ["Offset of field: __sFILE::_lbfsize"][::std::mem::offset_of!(__sFILE, _lbfsize) - 40usize];
-    ["Offset of field: __sFILE::_cookie"][::std::mem::offset_of!(__sFILE, _cookie) - 48usize];
-    ["Offset of field: __sFILE::_close"][::std::mem::offset_of!(__sFILE, _close) - 56usize];
-    ["Offset of field: __sFILE::_read"][::std::mem::offset_of!(__sFILE, _read) - 64usize];
-    ["Offset of field: __sFILE::_seek"][::std::mem::offset_of!(__sFILE, _seek) - 72usize];
-    ["Offset of field: __sFILE::_write"][::std::mem::offset_of!(__sFILE, _write) - 80usize];
-    ["Offset of field: __sFILE::_ub"][::std::mem::offset_of!(__sFILE, _ub) - 88usize];
-    ["Offset of field: __sFILE::_extra"][::std::mem::offset_of!(__sFILE, _extra) - 104usize];
-    ["Offset of field: __sFILE::_ur"][::std::mem::offset_of!(__sFILE, _ur) - 112usize];
-    ["Offset of field: __sFILE::_ubuf"][::std::mem::offset_of!(__sFILE, _ubuf) - 116usize];
-    ["Offset of field: __sFILE::_nbuf"][::std::mem::offset_of!(__sFILE, _nbuf) - 119usize];
-    ["Offset of field: __sFILE::_lb"][::std::mem::offset_of!(__sFILE, _lb) - 120usize];
-    ["Offset of field: __sFILE::_blksize"][::std::mem::offset_of!(__sFILE, _blksize) - 136usize];
-    ["Offset of field: __sFILE::_offset"][::std::mem::offset_of!(__sFILE, _offset) - 144usize];
-};
-pub type FILE = __sFILE;
 pub const SystemParam_SPI_SETDRAGFULLWINDOWS: SystemParam = 37;
 pub const SystemParam_SPI_SETKEYBOARDCUES: SystemParam = 4107;
 pub const SystemParam_SPI_SETKEYBOARDPREF: SystemParam = 69;
@@ -12130,12 +12049,6 @@ extern "C" {
 extern "C" {
     pub fn GetFileHandleForFileDescriptor(fd: ::std::os::raw::c_int) -> HANDLE;
 }
-extern "C" {
-    pub fn winpr_fopen(
-        path: *const ::std::os::raw::c_char,
-        mode: *const ::std::os::raw::c_char,
-    ) -> *mut FILE;
-}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct tagCHANNEL_DEF {
@@ -15195,13 +15108,6 @@ extern "C" {
         stringp: *mut *mut ::std::os::raw::c_char,
         delim: *const ::std::os::raw::c_char,
     ) -> *mut ::std::os::raw::c_char;
-}
-extern "C" {
-    pub fn GetLine(
-        lineptr: *mut *mut ::std::os::raw::c_char,
-        size: *mut usize,
-        stream: *mut FILE,
-    ) -> INT64;
 }
 extern "C" {
     pub fn wcsndup(s: *const WCHAR, n: usize) -> *mut WCHAR;

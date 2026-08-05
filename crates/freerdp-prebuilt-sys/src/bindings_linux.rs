@@ -11,127 +11,16 @@
 // `--allowlist-file` restricts this to items declared by FreeRDP's and WinPR's
 // own installed headers. Without it the output also carries whatever the
 // generating machine's libc declares, which is one platform's idea of it.
+//
+// The allowlist is not quite enough on its own: a type is emitted if an allowlisted
+// *signature* reaches it, whatever header declared it. Two WinPR functions take a
+// `FILE*`, which dragged glibc's `_IO_FILE` in — a struct whose layout differs
+// between one distribution's glibc and another's, so the committed file was only
+// valid on the machine that made it. Both functions are blocklisted; nothing in
+// this repository calls them, and a caller that wants one can use libc's own.
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 #![allow(clippy::all)]
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct __BindgenBitfieldUnit<Storage> {
-    storage: Storage,
-}
-impl<Storage> __BindgenBitfieldUnit<Storage> {
-    #[inline]
-    pub const fn new(storage: Storage) -> Self {
-        Self { storage }
-    }
-}
-impl<Storage> __BindgenBitfieldUnit<Storage>
-where
-    Storage: AsRef<[u8]> + AsMut<[u8]>,
-{
-    #[inline]
-    fn extract_bit(byte: u8, index: usize) -> bool {
-        let bit_index = if cfg!(target_endian = "big") { 7 - (index % 8) } else { index % 8 };
-        let mask = 1 << bit_index;
-        byte & mask == mask
-    }
-    #[inline]
-    pub fn get_bit(&self, index: usize) -> bool {
-        debug_assert!(index / 8 < self.storage.as_ref().len());
-        let byte_index = index / 8;
-        let byte = self.storage.as_ref()[byte_index];
-        Self::extract_bit(byte, index)
-    }
-    #[inline]
-    pub unsafe fn raw_get_bit(this: *const Self, index: usize) -> bool {
-        debug_assert!(index / 8 < core::mem::size_of::<Storage>());
-        let byte_index = index / 8;
-        let byte = unsafe {
-            *(core::ptr::addr_of!((*this).storage) as *const u8).offset(byte_index as isize)
-        };
-        Self::extract_bit(byte, index)
-    }
-    #[inline]
-    fn change_bit(byte: u8, index: usize, val: bool) -> u8 {
-        let bit_index = if cfg!(target_endian = "big") { 7 - (index % 8) } else { index % 8 };
-        let mask = 1 << bit_index;
-        if val {
-            byte | mask
-        } else {
-            byte & !mask
-        }
-    }
-    #[inline]
-    pub fn set_bit(&mut self, index: usize, val: bool) {
-        debug_assert!(index / 8 < self.storage.as_ref().len());
-        let byte_index = index / 8;
-        let byte = &mut self.storage.as_mut()[byte_index];
-        *byte = Self::change_bit(*byte, index, val);
-    }
-    #[inline]
-    pub unsafe fn raw_set_bit(this: *mut Self, index: usize, val: bool) {
-        debug_assert!(index / 8 < core::mem::size_of::<Storage>());
-        let byte_index = index / 8;
-        let byte = unsafe {
-            (core::ptr::addr_of_mut!((*this).storage) as *mut u8).offset(byte_index as isize)
-        };
-        unsafe { *byte = Self::change_bit(*byte, index, val) };
-    }
-    #[inline]
-    pub fn get(&self, bit_offset: usize, bit_width: u8) -> u64 {
-        debug_assert!(bit_width <= 64);
-        debug_assert!(bit_offset / 8 < self.storage.as_ref().len());
-        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= self.storage.as_ref().len());
-        let mut val = 0;
-        for i in 0..(bit_width as usize) {
-            if self.get_bit(i + bit_offset) {
-                let index =
-                    if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
-                val |= 1 << index;
-            }
-        }
-        val
-    }
-    #[inline]
-    pub unsafe fn raw_get(this: *const Self, bit_offset: usize, bit_width: u8) -> u64 {
-        debug_assert!(bit_width <= 64);
-        debug_assert!(bit_offset / 8 < core::mem::size_of::<Storage>());
-        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= core::mem::size_of::<Storage>());
-        let mut val = 0;
-        for i in 0..(bit_width as usize) {
-            if unsafe { Self::raw_get_bit(this, i + bit_offset) } {
-                let index =
-                    if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
-                val |= 1 << index;
-            }
-        }
-        val
-    }
-    #[inline]
-    pub fn set(&mut self, bit_offset: usize, bit_width: u8, val: u64) {
-        debug_assert!(bit_width <= 64);
-        debug_assert!(bit_offset / 8 < self.storage.as_ref().len());
-        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= self.storage.as_ref().len());
-        for i in 0..(bit_width as usize) {
-            let mask = 1 << i;
-            let val_bit_is_set = val & mask == mask;
-            let index = if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
-            self.set_bit(index + bit_offset, val_bit_is_set);
-        }
-    }
-    #[inline]
-    pub unsafe fn raw_set(this: *mut Self, bit_offset: usize, bit_width: u8, val: u64) {
-        debug_assert!(bit_width <= 64);
-        debug_assert!(bit_offset / 8 < core::mem::size_of::<Storage>());
-        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= core::mem::size_of::<Storage>());
-        for i in 0..(bit_width as usize) {
-            let mask = 1 << i;
-            let val_bit_is_set = val & mask == mask;
-            let index = if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
-            unsafe { Self::raw_set_bit(this, index + bit_offset, val_bit_is_set) };
-        }
-    }
-}
 pub const _M_AMD64: u32 = 1;
 pub const _M_IX86_AMD64: u32 = 1;
 pub const SPI_SETSCREENSAVEACTIVE: u32 = 17;
@@ -6191,7 +6080,6 @@ extern "C" {
 }
 pub type __gnuc_va_list = __builtin_va_list;
 pub type va_list = __gnuc_va_list;
-pub type FILE = _IO_FILE;
 pub const SystemParam_SPI_SETDRAGFULLWINDOWS: SystemParam = 37;
 pub const SystemParam_SPI_SETKEYBOARDCUES: SystemParam = 4107;
 pub const SystemParam_SPI_SETKEYBOARDPREF: SystemParam = 69;
@@ -7215,155 +7103,6 @@ const _: () = {
 pub type BITMAPFILEHEADER = tagBITMAPFILEHEADER;
 pub type LPBITMAPFILEHEADER = *mut tagBITMAPFILEHEADER;
 pub type PBITMAPFILEHEADER = *mut tagBITMAPFILEHEADER;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _IO_marker {
-    _unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _IO_codecvt {
-    _unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _IO_wide_data {
-    _unused: [u8; 0],
-}
-pub type _IO_lock_t = ::std::os::raw::c_void;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _IO_FILE {
-    pub _flags: ::std::os::raw::c_int,
-    pub _IO_read_ptr: *mut ::std::os::raw::c_char,
-    pub _IO_read_end: *mut ::std::os::raw::c_char,
-    pub _IO_read_base: *mut ::std::os::raw::c_char,
-    pub _IO_write_base: *mut ::std::os::raw::c_char,
-    pub _IO_write_ptr: *mut ::std::os::raw::c_char,
-    pub _IO_write_end: *mut ::std::os::raw::c_char,
-    pub _IO_buf_base: *mut ::std::os::raw::c_char,
-    pub _IO_buf_end: *mut ::std::os::raw::c_char,
-    pub _IO_save_base: *mut ::std::os::raw::c_char,
-    pub _IO_backup_base: *mut ::std::os::raw::c_char,
-    pub _IO_save_end: *mut ::std::os::raw::c_char,
-    pub _markers: *mut _IO_marker,
-    pub _chain: *mut _IO_FILE,
-    pub _fileno: ::std::os::raw::c_int,
-    pub _bitfield_align_1: [u32; 0],
-    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 3usize]>,
-    pub _short_backupbuf: [::std::os::raw::c_char; 1usize],
-    pub _old_offset: __off_t,
-    pub _cur_column: ::std::os::raw::c_ushort,
-    pub _vtable_offset: ::std::os::raw::c_schar,
-    pub _shortbuf: [::std::os::raw::c_char; 1usize],
-    pub _lock: *mut _IO_lock_t,
-    pub _offset: __off64_t,
-    pub _codecvt: *mut _IO_codecvt,
-    pub _wide_data: *mut _IO_wide_data,
-    pub _freeres_list: *mut _IO_FILE,
-    pub _freeres_buf: *mut ::std::os::raw::c_void,
-    pub _prevchain: *mut *mut _IO_FILE,
-    pub _mode: ::std::os::raw::c_int,
-    pub _unused2: [::std::os::raw::c_char; 20usize],
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _IO_FILE"][::std::mem::size_of::<_IO_FILE>() - 216usize];
-    ["Alignment of _IO_FILE"][::std::mem::align_of::<_IO_FILE>() - 8usize];
-    ["Offset of field: _IO_FILE::_flags"][::std::mem::offset_of!(_IO_FILE, _flags) - 0usize];
-    ["Offset of field: _IO_FILE::_IO_read_ptr"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_read_ptr) - 8usize];
-    ["Offset of field: _IO_FILE::_IO_read_end"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_read_end) - 16usize];
-    ["Offset of field: _IO_FILE::_IO_read_base"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_read_base) - 24usize];
-    ["Offset of field: _IO_FILE::_IO_write_base"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_write_base) - 32usize];
-    ["Offset of field: _IO_FILE::_IO_write_ptr"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_write_ptr) - 40usize];
-    ["Offset of field: _IO_FILE::_IO_write_end"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_write_end) - 48usize];
-    ["Offset of field: _IO_FILE::_IO_buf_base"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_buf_base) - 56usize];
-    ["Offset of field: _IO_FILE::_IO_buf_end"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_buf_end) - 64usize];
-    ["Offset of field: _IO_FILE::_IO_save_base"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_save_base) - 72usize];
-    ["Offset of field: _IO_FILE::_IO_backup_base"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_backup_base) - 80usize];
-    ["Offset of field: _IO_FILE::_IO_save_end"]
-        [::std::mem::offset_of!(_IO_FILE, _IO_save_end) - 88usize];
-    ["Offset of field: _IO_FILE::_markers"][::std::mem::offset_of!(_IO_FILE, _markers) - 96usize];
-    ["Offset of field: _IO_FILE::_chain"][::std::mem::offset_of!(_IO_FILE, _chain) - 104usize];
-    ["Offset of field: _IO_FILE::_fileno"][::std::mem::offset_of!(_IO_FILE, _fileno) - 112usize];
-    ["Offset of field: _IO_FILE::_short_backupbuf"]
-        [::std::mem::offset_of!(_IO_FILE, _short_backupbuf) - 119usize];
-    ["Offset of field: _IO_FILE::_old_offset"]
-        [::std::mem::offset_of!(_IO_FILE, _old_offset) - 120usize];
-    ["Offset of field: _IO_FILE::_cur_column"]
-        [::std::mem::offset_of!(_IO_FILE, _cur_column) - 128usize];
-    ["Offset of field: _IO_FILE::_vtable_offset"]
-        [::std::mem::offset_of!(_IO_FILE, _vtable_offset) - 130usize];
-    ["Offset of field: _IO_FILE::_shortbuf"]
-        [::std::mem::offset_of!(_IO_FILE, _shortbuf) - 131usize];
-    ["Offset of field: _IO_FILE::_lock"][::std::mem::offset_of!(_IO_FILE, _lock) - 136usize];
-    ["Offset of field: _IO_FILE::_offset"][::std::mem::offset_of!(_IO_FILE, _offset) - 144usize];
-    ["Offset of field: _IO_FILE::_codecvt"][::std::mem::offset_of!(_IO_FILE, _codecvt) - 152usize];
-    ["Offset of field: _IO_FILE::_wide_data"]
-        [::std::mem::offset_of!(_IO_FILE, _wide_data) - 160usize];
-    ["Offset of field: _IO_FILE::_freeres_list"]
-        [::std::mem::offset_of!(_IO_FILE, _freeres_list) - 168usize];
-    ["Offset of field: _IO_FILE::_freeres_buf"]
-        [::std::mem::offset_of!(_IO_FILE, _freeres_buf) - 176usize];
-    ["Offset of field: _IO_FILE::_prevchain"]
-        [::std::mem::offset_of!(_IO_FILE, _prevchain) - 184usize];
-    ["Offset of field: _IO_FILE::_mode"][::std::mem::offset_of!(_IO_FILE, _mode) - 192usize];
-    ["Offset of field: _IO_FILE::_unused2"][::std::mem::offset_of!(_IO_FILE, _unused2) - 196usize];
-};
-impl _IO_FILE {
-    #[inline]
-    pub fn _flags2(&self) -> ::std::os::raw::c_int {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(0usize, 24u8) as u32) }
-    }
-    #[inline]
-    pub fn set__flags2(&mut self, val: ::std::os::raw::c_int) {
-        unsafe {
-            let val: u32 = ::std::mem::transmute(val);
-            self._bitfield_1.set(0usize, 24u8, val as u64)
-        }
-    }
-    #[inline]
-    pub unsafe fn _flags2_raw(this: *const Self) -> ::std::os::raw::c_int {
-        unsafe {
-            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 3usize]>>::raw_get(
-                ::std::ptr::addr_of!((*this)._bitfield_1),
-                0usize,
-                24u8,
-            ) as u32)
-        }
-    }
-    #[inline]
-    pub unsafe fn set__flags2_raw(this: *mut Self, val: ::std::os::raw::c_int) {
-        unsafe {
-            let val: u32 = ::std::mem::transmute(val);
-            <__BindgenBitfieldUnit<[u8; 3usize]>>::raw_set(
-                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                0usize,
-                24u8,
-                val as u64,
-            )
-        }
-    }
-    #[inline]
-    pub fn new_bitfield_1(_flags2: ::std::os::raw::c_int) -> __BindgenBitfieldUnit<[u8; 3usize]> {
-        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 3usize]> = Default::default();
-        __bindgen_bitfield_unit.set(0usize, 24u8, {
-            let _flags2: u32 = unsafe { ::std::mem::transmute(_flags2) };
-            _flags2 as u64
-        });
-        __bindgen_bitfield_unit
-    }
-}
 extern "C" {
     pub fn winpr_get_version(
         major: *mut ::std::os::raw::c_int,
@@ -12308,12 +12047,6 @@ extern "C" {
 extern "C" {
     pub fn GetFileHandleForFileDescriptor(fd: ::std::os::raw::c_int) -> HANDLE;
 }
-extern "C" {
-    pub fn winpr_fopen(
-        path: *const ::std::os::raw::c_char,
-        mode: *const ::std::os::raw::c_char,
-    ) -> *mut FILE;
-}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct tagCHANNEL_DEF {
@@ -15373,13 +15106,6 @@ extern "C" {
         stringp: *mut *mut ::std::os::raw::c_char,
         delim: *const ::std::os::raw::c_char,
     ) -> *mut ::std::os::raw::c_char;
-}
-extern "C" {
-    pub fn GetLine(
-        lineptr: *mut *mut ::std::os::raw::c_char,
-        size: *mut usize,
-        stream: *mut FILE,
-    ) -> INT64;
 }
 extern "C" {
     pub fn wcsndup(s: *const WCHAR, n: usize) -> *mut WCHAR;

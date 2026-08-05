@@ -130,6 +130,12 @@ generate() {
   bindgen wrapper.h \
     --rust-target 1.81 \
     --allowlist-file "$allowlist" \
+    --blocklist-function 'winpr_fopen' \
+    --blocklist-function 'GetLine' \
+    --blocklist-type 'FILE' \
+    --blocklist-type '_IO_.*' \
+    --blocklist-type '__sFILE.*' \
+    --blocklist-type '__sbuf' \
     --default-enum-style consts \
     --constified-enum-module 'FreeRDP_Settings_Keys_.*' \
     --no-doc-comments \
@@ -144,6 +150,13 @@ generate() {
     --raw-line "// \`--allowlist-file\` restricts this to items declared by FreeRDP's and WinPR's" \
     --raw-line "// own installed headers. Without it the output also carries whatever the" \
     --raw-line "// generating machine's libc declares, which is one platform's idea of it." \
+    --raw-line "//" \
+    --raw-line "// The allowlist is not quite enough on its own: a type is emitted if an allowlisted" \
+    --raw-line "// *signature* reaches it, whatever header declared it. Two WinPR functions take a" \
+    --raw-line "// \`FILE*\`, which dragged glibc's \`_IO_FILE\` in — a struct whose layout differs" \
+    --raw-line "// between one distribution's glibc and another's, so the committed file was only" \
+    --raw-line "// valid on the machine that made it. Both functions are blocklisted; nothing in" \
+    --raw-line "// this repository calls them, and a caller that wants one can use libc's own." \
     --raw-line "#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]" \
     --raw-line "#![allow(clippy::all)]" \
     -- -I include/freerdp3 -I include/winpr3
