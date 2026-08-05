@@ -125,6 +125,18 @@ openssl_args=(
 )
 [ "$target" = "macos-arm64" ] && openssl_args+=("-mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET")
 
+# **The one thing in this build that was not reproducible**, and it was CI that said so rather
+# than anybody predicting it: `util/mkbuildinf.pl` writes `#define DATE "built on: <now>"` into
+# `crypto/buildinf.h`, which is compiled into `cversion.o` and therefore into `libcrypto.a` and
+# nothing else. Two builds an hour apart differed in exactly that one archive while FreeRDP's
+# three and `libssl.a` matched to the byte.
+#
+# The generator reads `SOURCE_DATE_EPOCH` and says in a comment that it honours it "even if it's
+# zero or the empty string", so zero is a value it was designed to take rather than one that
+# happens to work. Zero rather than a date: the string is a placeholder either way, and an epoch
+# nobody chose cannot go stale or start an argument about which date it should have been.
+export SOURCE_DATE_EPOCH=0
+
 echo ">> configuring OpenSSL ${OPENSSL_VERSION} ($openssl_target) for $target"
 mkdir -p "$work/openssl-build"
 (
@@ -146,6 +158,16 @@ for archive in libssl.a libcrypto.a; do
     exit 1
   }
 done
+# And that the epoch above actually reached the generated header, rather than being exported into
+# a build that ignored it. Asserted here rather than left to the reproducibility job in CI: that
+# job runs on one target and builds twice, so it costs ten minutes to tell us what one grep can,
+# and it does not run at all on the two targets it does not cover.
+epoch_date="built on: $(LC_ALL=C TZ=UTC perl -e 'print scalar gmtime(0)') UTC"
+if ! LC_ALL=C grep -aqF "$epoch_date" "$ssl_prefix/lib/libcrypto.a"; then
+  echo "libcrypto.a does not carry the fixed build date, so this build is not reproducible:" >&2
+  LC_ALL=C grep -aoE 'built on: [^"]*' "$ssl_prefix/lib/libcrypto.a" | head -1 >&2
+  exit 1
+fi
 echo "   $ssl_prefix/lib/{libssl,libcrypto}.a"
 
 # ---------------------------------------------------------------- FreeRDP
