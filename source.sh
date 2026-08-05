@@ -75,12 +75,12 @@ _fetch_verify_unpack() {
     # Non-empty *and* one line. `wc -l` on nothing counts 1 here, because a here-string always ends
     # in a newline — so a tarball that unpacked no directory at all otherwise passes this check and
     # reaches `mv` with an empty source, which fails as a usage error naming neither tarball.
-    [ -n "$inner" ] && [ "$(wc -l <<<"$inner")" -eq 1 ] || {
+    if [ -z "$inner" ] || [ "$(wc -l <<<"$inner")" -ne 1 ]; then
       echo "$tarball does not hold exactly one top-level directory:" >&2
       printf '  %s\n' "$inner" >&2
       rm -rf "build/$dir.unpack"
       return 1
-    }
+    fi
     mv "$inner" "build/$dir"
     rm -rf "build/$dir.unpack"
   fi
