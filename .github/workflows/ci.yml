@@ -1,16 +1,57 @@
 name: CI
 
-# Placeholder. The real workflow lands with the code it is meant to gate — there is nothing to
-# shellcheck, clippy or build yet, and a workflow that runs on every push before then would be a
-# red X against a repository that contains a README.
+# What runs on every push: the cheap checks that need no archive, and then one real target built
+# and exercised end to end.
+#
+# The second half is `uses: ./.github/workflows/build.yml` rather than a copy of its steps. The
+# thing worth checking on a push is that the pipeline still works, and a second implementation of
+# it would be a thing that can pass while the pipeline does not. `targets: x86_64` keeps it to one
+# runner; the other two are a `workflow_dispatch` away and are gated on every release regardless.
 on:
-  workflow_dispatch:
+  push:
+    branches: ["**"]
+  pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  placeholder:
+  checks:
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "CI is not wired up yet."
+      - uses: actions/checkout@v5
+
+      # Every script here is bash, and every one is `set -euo pipefail` over paths that can
+      # contain anything. shellcheck is what makes that claim true rather than intended.
+      - name: shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          # `-x` so it *follows* the sourced files rather than reporting each one as unknown:
+          # `source.sh` and `freerdp.env` are sourced, never run, and the `# shellcheck source=`
+          # directives at each site say where they are. Without `-x` those directives are read and
+          # then ignored, which is an SC1091 per site and no checking of what they contain.
+          shellcheck -x build.sh sync-prebuilt.sh check-static.sh source.sh \
+            crates/freerdp-prebuilt-sys/gen-bindings.sh
+
+      # **No `cargo fmt --check`**, deliberately. `rustfmt.toml` is here because *bindgen* reads
+      # it — it is what decides the shape of the two committed `src/bindings_*.rs`, and a
+      # generating machine that formatted them differently would make `--check` fail for reasons
+      # unrelated to the headers. Applying rustfmt to the hand-written code as well is a separate
+      # decision, and this project has not taken it: the comments in these files carry the
+      # reasoning and are laid out to be read, which is not something a width heuristic is good
+      # at. `gen-bindings.sh` still *requires* rustfmt, because the alternative there is a 16-line
+      # unreviewable file.
+
+      # No clippy here either. Every crate in this workspace links the archives, so clippy cannot
+      # run until they have been built — which is what the build job below does, and where clippy
+      # therefore lives.
+
+  # The pipeline itself, on one target, including the header and bindings checks.
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      targets: x86_64

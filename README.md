@@ -115,7 +115,7 @@ the two files differ in 626 lines.
 
 ## The wrapper
 
-`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse, clipboard and resize.
+`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse and clipboard.
 
 ```rust
 let (session, events) = Session::start(Connect { host, username, password, ..Default::default() });
@@ -134,13 +134,9 @@ reallocated under you on resize, an event loop driven by `WaitForMultipleObjects
 interfaces that arrive through a pub/sub. Getting that wrong is a use-after-free rather than a
 wrong pixel, and it is the same shape for everybody who embeds it.
 
-Dynamic resize is there but **off by default** (`Connect::resize`), because a server answers a
-monitor layout by renegotiating the whole session — the most disruptive thing a client can ask
-for, and a session that never asks never meets it.
-
-What it does **not** do, deliberately: no audio, no graphics pipeline, no certificate
-verification, no file-transfer clipboard, no multiple monitors, and no retrying of a resize. Each
-of those is documented where it is decided, with the reason. The EGFX one is worth repeating: against a Windows 11 host with the
+What it does **not** do, deliberately: no audio, no dynamic resize, no graphics pipeline, no
+certificate verification, no file-transfer clipboard. Each of those is documented where it is
+decided, with the reason. The EGFX one is worth repeating: against a Windows 11 host with the
 graphics pipeline advertised, FreeRDP decoded 21 surface commands with no errors and produced a
 framebuffer that summed to *exactly* black; with `SupportGraphicsPipeline = FALSE` the same host,
 the same build and the same second painted a real desktop.

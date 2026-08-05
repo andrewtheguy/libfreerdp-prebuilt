@@ -1,0 +1,8 @@
+# 100 columns, because the comments in this repository carry the reasoning and 80 turns every
+# explanation into a column of fragments.
+#
+# It also decides the shape of the committed bindings: bindgen runs rustfmt over its output and
+# picks up this file, so the two `src/bindings_*.rs` are formatted by this and not by whichever
+# defaults the generating machine had.
+max_width = 100
+use_small_heuristics = "Max"

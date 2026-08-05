@@ -1,0 +1,21 @@
+# The Rust half of this repository: an FFI crate that links the prebuilt archives ./build.sh
+# produces, a safe wrapper over it, and a consumer that proves both work.
+#
+# Three members rather than one. The wrapper exists here — and not, as in libvpx-prebuilt, in the
+# project that uses it — because FreeRDP's embedder API is not a call, it is a *lifecycle*: a
+# context whose callbacks fire on FreeRDP's own thread, a framebuffer that is reallocated under
+# you on resize, an event loop driven by `WaitForMultipleObjects`, and channel interfaces that
+# arrive through a pub/sub. Getting that wrong is a use-after-free rather than a wrong pixel, and
+# it is the same shape for everybody who embeds it. A codec's configuration is not.
+#
+# The third is not a library at all — it is a *consumer*, built and run by the pipeline on every
+# target, because linking archives into a binary that connects to a real RDP server is a
+# different claim from compiling a test.
+[workspace]
+members = ["crates/freerdp-prebuilt-sys", "crates/freerdp", "crates/freerdp-e2e"]
+resolver = "2"
+
+[workspace.package]
+# Not FreeRDP's version — that is in freerdp.env, and a consumer pins this by git tag anyway.
+# This number moves when the *crates* change shape.
+version = "0.1.0"

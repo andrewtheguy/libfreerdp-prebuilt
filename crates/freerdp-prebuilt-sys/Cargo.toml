@@ -1,0 +1,33 @@
+[package]
+name = "freerdp-prebuilt-sys"
+version.workspace = true
+edition = "2021"
+# 2021, not 2024, and no MSRV-raising syntax: this crate's whole job is to be linkable from other
+# people's projects, so it should not be the thing that forces a toolchain upgrade on any of them.
+#
+# 1.77 rather than something older because bindgen writes the layout assertions in
+# src/bindings.rs with `std::mem::offset_of!`, which is where they stabilised. It is *not* 1.82:
+# that is what bindgen's default `--rust-target` would have cost, by emitting `unsafe extern "C"`
+# blocks, and gen-bindings.sh pins the target to 1.81 to keep it from doing so. This number is a
+# measurement of what the generated file needs, so check it after a bindgen bump.
+rust-version = "1.77"
+description = "Raw FFI for FreeRDP 3's client API, linked from prebuilt static archives — no cmake, no pkg-config, no OpenSSL to install, no libclang"
+# FreeRDP is Apache-2.0, and so is the OpenSSL 3 shipped in the same archive. Both licence texts
+# travel with every archive and sit at the repository root.
+license = "Apache-2.0"
+repository = "https://github.com/andrewtheguy/libfreerdp-prebuilt"
+# Declared so that two crates linking FreeRDP into one binary is a cargo error rather than a
+# duplicate-symbol link error, and so consumers can read DEP_FREERDP_INCLUDE.
+links = "freerdp"
+build = "build.rs"
+# git-only, deliberately: the archives are what makes this crate work and they are large binary
+# files that live on releases rather than in the crate.
+publish = false
+
+# `freerdp_sys`, so a consumer writes `use freerdp_sys::…` — the same shape as the other `*_sys`
+# crates it sits beside in the project this was built for.
+[lib]
+name = "freerdp_sys"
+path = "src/lib.rs"
+
+[dependencies]

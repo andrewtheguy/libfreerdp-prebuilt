@@ -1,0 +1,14 @@
+[package]
+name = "freerdp"
+version.workspace = true
+edition = "2021"
+# Same reasoning as the -sys crate: this is meant to be linkable from other people's projects, so
+# it should not be the thing that forces a toolchain upgrade on any of them.
+rust-version = "1.77"
+description = "A safe, headless RDP client over FreeRDP 3 — screen, cursor, keyboard, mouse and clipboard"
+license = "Apache-2.0"
+repository = "https://github.com/andrewtheguy/libfreerdp-prebuilt"
+publish = false
+
+[dependencies]
+freerdp-sys = { package = "freerdp-prebuilt-sys", path = "../freerdp-prebuilt-sys" }

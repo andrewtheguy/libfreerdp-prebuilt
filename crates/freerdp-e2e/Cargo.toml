@@ -1,0 +1,11 @@
+[package]
+name = "freerdp-e2e"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "A consumer of the prebuilt archives, run on every target in CI"
+
+[dependencies]
+freerdp = { path = "../freerdp" }
+freerdp-sys = { package = "freerdp-prebuilt-sys", path = "../freerdp-prebuilt-sys" }

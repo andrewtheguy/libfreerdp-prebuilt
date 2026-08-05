@@ -1,16 +1,225 @@
 name: Build FreeRDP
 
-# Placeholder. This is where the archives get built and tested; it is manual-only until there is
-# a build.sh for it to call, so that the file can exist — and be referenced by the others — before
-# it does anything.
+# Build every archive and test it. This workflow never publishes — releasing is release.yml,
+# which calls this one and then does the publishing part. Two triggers instead of one, so that
+# "does it build and pass" can be asked at any time without anybody being committed to a release
+# by asking.
+#
+# `workflow_dispatch` is the test loop and the bootstrap: the very first run of this repository's
+# pipeline has to be this workflow, because nothing can be downloaded from a release that does not
+# exist yet.
+#
+# `workflow_call` is release.yml and ci.yml. A failure anywhere in here — a build, the link test,
+# the e2e binary, `check-static.sh`, the bindings check — fails the caller's job, and for
+# release.yml that means the release never happens.
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: "which targets to build and test"
+        type: choice
+        default: all
+        options: [all, x86_64, arm64]
+  workflow_call:
+    inputs:
+      targets:
+        description: "which targets to build and test"
+        type: string
+        default: all
 
+# Read-only. The token that can create a release belongs to the job that creates one, and that job
+# is in the other file.
 permissions:
   contents: read
 
+env:
+  BINDGEN_VERSION: "0.72.1"
+
 jobs:
-  placeholder:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.matrix.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The matrix, narrowed here as *data* rather than by a job-level `if`. Two reasons, one hard
+      # and one practical: a job-level condition cannot reference `matrix` at all — GitHub rejects
+      # the workflow outright — and filtering before the fan-out means a `targets: x86_64` dispatch
+      # starts one runner instead of three.
+      - id: matrix
+        env:
+          GROUP: ${{ inputs.targets || 'all' }}
+        run: |
+          all='[
+            {"target":"macos-arm64",   "runs-on":"macos-latest",    "group":"arm64"},
+            {"target":"linux-x86_64",  "runs-on":"ubuntu-24.04",    "group":"x86_64"},
+            {"target":"linux-aarch64", "runs-on":"ubuntu-24.04-arm","group":"arm64"}
+          ]'
+          targets="$(jq -c --arg g "$GROUP" '[.[] | select($g == "all" or .group == $g)]' <<<"$all")"
+          echo "$targets" | jq -r '.[].target' | sed 's/^/  /'
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      # No fail-fast: one target failing to configure is exactly the case where the other two logs
+      # are the useful comparison.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.targets) }}
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # cmake and ninja on the *builder* only. Nothing a consumer of this repository does needs
+      # either, which is the whole point — see the README's table.
+      - name: Install the build tools
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y cmake ninja-build
+          else
+            brew install ninja
+          fi
+
+      - name: Build ${{ matrix.target }}
+        run: ./build.sh ${{ matrix.target }}
+
+      - name: Show what was built
+        run: cat dist/${{ matrix.target }}/MANIFEST
+
+      # The half the archives alone do not cover: whether Rust can *link* them. That is what breaks
+      # in practice — an `.a` for the wrong ABI, a system library nobody measured, a symbol under a
+      # name nobody expected — and none of it shows up in a successful cmake build. `--offline`,
+      # after sync-prebuilt.sh, also demonstrates the claim consumers care about: once the archives
+      # exist, no build needs a network.
+      - name: Link against it
+        run: |
+          ./sync-prebuilt.sh
+          cargo build --offline --release --workspace
+
+      # Here rather than in ci.yml's cheap-checks job, because every crate in this workspace links
+      # the archives and clippy cannot run until they exist.
+      - name: clippy
+        run: cargo clippy --offline --release --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --offline --release --workspace
+
+      # The end-to-end leg. Without a server this proves the archives link into a running binary,
+      # that the *pinned* FreeRDP is what got linked, and that a context can be built, configured
+      # and torn down. With one it proves the rest — see the xrdp job below.
+      - name: End to end — a real binary that links the archives
+        run: |
+          ./target/release/freerdp-e2e
+          ./check-static.sh target/release/freerdp-e2e
+
+      # And that the committed headers are the ones this artifact's own `cmake --install`
+      # produced, plus that bindgen still makes the committed bindings out of them.
+      #
+      # **Every target runs this, and that is the point.** `winpr/wtypes.h` makes `BOOL` a
+      # four-byte int32_t off Apple and a one-byte value on it, so there are two committed
+      # bindings files and each is only checkable on its own platform. Running this everywhere is
+      # what keeps both honest — and running it on *both* Linux architectures is what says
+      # `bindings_linux.rs` may be one file rather than two.
+      - name: The committed headers and bindings are what this build produces
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get install -y libclang-dev
+          fi
+          rustup component add rustfmt
+          cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
+          ./sync-prebuilt.sh --check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freerdp-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  # The connecting half of the e2e, against a real RDP server.
+  #
+  # Linux only, and that is a property of the runners rather than of this crate: GitHub's macOS
+  # runners cannot run Linux containers, so there is no xrdp for them to talk to. Said here rather
+  # than left to look like full coverage — on macOS the e2e above stops at "the archives link and
+  # a context works".
+  xrdp:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.targets).*.target, 'linux-x86_64')
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "Nothing to build yet."
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Build and link
+        run: |
+          ./build.sh linux-x86_64
+          ./sync-prebuilt.sh
+          cargo build --offline --release -p freerdp-e2e
+
+      # A real xrdp, painting a real login screen. `Xvnc` as the backend keeps the image small and
+      # gives xrdp something to actually draw, which is what makes "the framebuffer is not all
+      # zero" a meaningful assertion rather than a tautology.
+      - name: Start an xrdp
+        run: |
+          docker run -d --name xrdp -p 3389:3389 \
+            -e "TZ=UTC" \
+            danielguerra/ubuntu-xrdp:20.04 || {
+              echo "::error::could not start the xrdp container"
+              exit 1
+            }
+          # Poll rather than sleep: a fixed wait is either too short on a slow runner or wasted on
+          # a fast one, and the thing being waited for is observable.
+          for _ in $(seq 1 60); do
+            if timeout 1 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+              echo "xrdp is listening"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::xrdp never started listening on 3389"
+          docker logs xrdp
+          exit 1
+
+      - name: Connect, paint, disconnect
+        run: ./target/release/freerdp-e2e 127.0.0.1 ubuntu ubuntu 3389
+
+      - if: always()
+        run: docker logs xrdp || true
+
+  # Does the same source, built twice on the same image, produce the same libraries?
+  #
+  # linux-x86_64 only, and that is a measurement rather than laziness. FreeRDP compiles no
+  # `__DATE__` anywhere (checked), so there is nothing to substitute with `SOURCE_DATE_EPOCH`;
+  # what is left is the `ar` container, whose member mtimes and uids GNU ar can be told to zero
+  # (`qcD`, which build.sh passes on Linux) and Apple's ar cannot. So macOS archives differ
+  # between builds by design and this job would fail on them for a reason that is not a defect.
+  #
+  # What it protects is the `sha256(lib/…)` lines in every MANIFEST: they are the only checksums
+  # in this repository meant to be comparable *between releases*, and a build that is not
+  # reproducible makes them comparable to nothing. It is also what would catch an `ar` append rule
+  # sneaking into the build — see build.sh's note on CMAKE_C_ARCHIVE_APPEND.
+  reproducible:
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.targets).*.target, 'linux-x86_64')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Build it twice and compare the libraries
+        run: |
+          ./build.sh linux-x86_64 >/dev/null
+          grep '^sha256(lib/' dist/linux-x86_64/MANIFEST | sort > first.txt
+          # A different build directory is not enough — the point is a *clean* second build, so
+          # nothing can be reused from the first.
+          rm -rf build/linux-x86_64 dist/linux-x86_64
+          ./build.sh linux-x86_64 >/dev/null
+          grep '^sha256(lib/' dist/linux-x86_64/MANIFEST | sort > second.txt
+          if diff -u first.txt second.txt; then
+            echo "reproducible"
+          else
+            echo "::error::two builds of the same source produced different libraries"
+            exit 1
+          fi

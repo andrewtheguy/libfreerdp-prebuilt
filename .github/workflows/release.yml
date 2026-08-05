@@ -1,16 +1,265 @@
 name: Release FreeRDP archives
 
-# Placeholder. Publishing stays manual and stays separate from building, so that "does this build
-# and pass" can be asked without anybody being committed to a release by asking. There is nothing
-# to publish yet.
+# Manual, and separate from build.yml on purpose: "does this build and pass" is a question worth
+# asking at any time, and it should not require being committed to a release to ask it. This
+# workflow answers the other question, and it answers it by *calling* build.yml rather than
+# repeating it — so the archives that get published are the ones that passed the same tests, run
+# by the same code, and a failure anywhere in there means no release.
+#
+# Draft first, publish last. The property that buys: **a draft release does not create the git
+# tag.** Everything — three builds, their link tests, the e2e binaries, the xrdp connection, the
+# reproducibility check, packaging, upload — happens while the tag still does not exist, and the
+# tag appears only when the draft is published at the very end. A cancelled or failed release
+# leaves a deletable draft rather than a tag pointing at archives nobody should link.
+#
+# The tag is *computed*, never typed: `v<freerdp>-<YYYYMMDDHHMMSS>-<short sha>`. The version says
+# what is inside, the timestamp says when, and the hash says which commit — and because this job
+# derives all three from the tree it is building, none of them can disagree with it.
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  placeholder:
-    runs-on: ubuntu-24.04
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+      stamp: ${{ steps.tag.outputs.stamp }}
+      is_prerelease: ${{ steps.tag.outputs.is_prerelease }}
     steps:
-      - run: echo "Nothing to release yet."
+      - uses: actions/checkout@v5
+
+      - name: Determine the tag
+        id: tag
+        run: |
+          . ./freerdp.env
+          # freerdp.env is hand-edited, and every asset filename is built from this value, so a
+          # typo here becomes a release full of misnamed archives that no consumer's build.rs can
+          # find.
+          echo "$FREERDP_VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || {
+            echo "::error::FREERDP_VERSION in freerdp.env is not a version: '$FREERDP_VERSION'"
+            exit 1
+          }
+          # And both source pins, which are what gate the build against upstream. A mistyped
+          # checksum would fail source.sh on every runner, which is a slower way to learn the same
+          # thing.
+          for pin in "$FREERDP_SHA256" "$OPENSSL_SHA256"; do
+            echo "$pin" | grep -Eq '^[0-9a-f]{64}$' || {
+              echo "::error::a sha256 pin in freerdp.env is not a sha256: '$pin'"
+              exit 1
+            }
+          done
+          # `$GITHUB_SHA` rather than `git rev-parse --short HEAD`: it is the commit this run is
+          # building, by definition, and it needs neither a .git directory nor a checkout deep
+          # enough to have one.
+          [ ${#GITHUB_SHA} -eq 40 ] || {
+            echo "::error::GITHUB_SHA is not a full sha: '$GITHUB_SHA'"
+            exit 1
+          }
+          # The build stamp, and the tag built from it — in that order, and both exported, because
+          # the release title wants the stamp on its own and deriving it back out of the finished
+          # tag is how a title ends up with its version in it twice.
+          #
+          # Seconds, not just the date: two releases on one day would otherwise sort by nothing
+          # useful, the only thing distinguishing them being a commit hash with no order to it. A
+          # full timestamp sorts lexicographically, which is the order they happened. UTC, so it
+          # does not depend on the timezone of whoever pressed the button.
+          stamp="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}"
+          tag="v${FREERDP_VERSION}-${stamp}"
+          # Never `latest` off a branch: a release built from anything but the default branch is a
+          # prerelease.
+          is_prerelease=false
+          [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ] || is_prerelease=true
+
+          echo "releasing $tag from $GITHUB_REF_NAME (prerelease=$is_prerelease)"
+          echo "version=${FREERDP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
+
+      # Vestigial now that the stamp carries seconds — two runs of this workflow cannot collide
+      # unless they start in the same second on the same commit. Kept because it costs one request
+      # and the thing it guards against is a tag silently moving.
+      - name: Abort if the tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.tag.outputs.tag }}" | grep -q .; then
+            echo "::error::Tag ${{ steps.tag.outputs.tag }} already exists."
+            exit 1
+          fi
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A leftover draft from a failed run is the only thing that can collide, since a draft
+          # never created a tag for the check above to have found.
+          if gh release view "${{ steps.tag.outputs.tag }}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "Deleting stale draft ${{ steps.tag.outputs.tag }}"
+            gh release delete "${{ steps.tag.outputs.tag }}" --yes
+          fi
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --draft \
+            --target "${{ github.sha }}" \
+            --title "FreeRDP ${{ steps.tag.outputs.version }} static archives - ${{ steps.tag.outputs.stamp }}" \
+            --generate-notes \
+            ${{ steps.tag.outputs.is_prerelease == 'true' && '--prerelease' || '' }}
+
+  # Every target, built and tested by the same workflow the manual test loop uses. Not a copy of
+  # it — the same file.
+  archives:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      targets: all
+
+  publish:
+    needs: [prepare, archives]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # No `merge-multiple`: each target's artifact is a *tree* (lib/, include/, MANIFEST, the two
+      # licences) and they must stay in separate directories to be packaged separately.
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: freerdp-*
+          path: artifacts
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p dist
+          # Named here rather than discovered, so that a target silently missing from the matrix
+          # is a failed release instead of a release somebody links against six months later and
+          # finds nothing for their platform.
+          expected="macos-arm64 linux-x86_64 linux-aarch64"
+          for target in $expected; do
+            dir="artifacts/freerdp-$target"
+            [ -f "$dir/MANIFEST" ] || {
+              echo "::error::no archive for $target — refusing to publish an incomplete release"
+              exit 1
+            }
+            tar czf "dist/freerdp-${VERSION}-${target}.tar.gz" -C "$dir" .
+          done
+
+          # SHA256SUMS, generated here and published as an asset — never committed. GitHub does
+          # record a sha256 digest per asset, but only through `api.github.com`, which is a second
+          # request, rate-limited to 60/hour for anyone unauthenticated, and JSON that a
+          # zero-dependency build.rs would have to parse. An asset beside the archives is one more
+          # plain GET from the URL it is already using.
+          #
+          # It is a corruption check, not a tamper check: it lives on the same release as the
+          # files it covers, so it proves the download arrived intact, not that the release is
+          # honest. The pins that constrain a party other than us are FREERDP_SHA256 and
+          # OPENSSL_SHA256, asserted against upstream's tarballs before a compiler runs.
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          ls -l dist
+
+      - name: Upload the assets to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            dist/SHA256SUMS dist/*.tar.gz --clobber
+
+      - name: Add the consumer notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          # Appended to the generated commit list rather than replacing it: the commits say what
+          # changed, and this says what to do about it. Anyone arriving at this release wants the
+          # second thing and will not find it in a diff.
+          gh release view "$TAG" --json body --jq '.body' > notes.md
+          cat >> notes.md <<EOF
+
+          ---
+
+          ## Using these from Rust
+
+          \`\`\`toml
+          freerdp = { git = "https://github.com/${GITHUB_REPOSITORY}", tag = "${TAG}" }
+          \`\`\`
+
+          That is the safe wrapper — a headless RDP client: connect, a Rust-owned framebuffer kept
+          up to date, damage rectangles, cursor, keyboard, mouse and clipboard. For the raw FFI,
+          depend on \`freerdp-prebuilt-sys\` instead; \`[lib] name = "freerdp_sys"\`, so the calls
+          read \`freerdp_sys::freerdp_connect()\`.
+
+          Nothing needs pinning beyond the tag: \`build.rs\` fetches the archives for its target
+          from this repository's latest release, so a consuming project picks up new archives by
+          updating its git dependency and nothing else.
+
+          ## What is in the archives
+
+          The client side of FreeRDP **${{ needs.prepare.outputs.version }}**, plus a static
+          **OpenSSL** built alongside it, with six channels compiled in: \`cliprdr\`, \`disp\`,
+          \`drdynvc\`, \`rdpdr\`, \`rdpgfx\` and \`rdpsnd\`. No server, no shadow, no proxy, no
+          X11/Wayland/SDL client, no FFmpeg, no OpenH264, no smartcard, no Kerberos.
+
+          The channel set is deliberately wider than the wrapper uses. cmake generates the addin
+          table at *configure* time, so the set is frozen into the archive and a consumer cannot
+          enable one later — building them all in now means audio and dynamic resize need no new
+          release. Static linking is per-object, so a binary that never mentions \`rdpsnd\` pulls
+          none of it in.
+
+          ## No toolchain, and no C++ runtime
+
+          A consumer needs no cmake, no pkg-config, no OpenSSL installed and no libclang. The
+          bindings are committed, generated from the headers in \`include/\` and checked against
+          them in CI on every target.
+
+          On Linux \`build.rs\` emits \`-lm -ldl -lpthread\`, and on macOS \`-framework\`
+          CoreFoundation, CoreServices and Carbon — in both cases because the build *measured*
+          the archives' undefined symbols and then proved the answer by linking a probe against
+          exactly that set. \`cxx_runtime\` is \`none\` on every target.
+
+          ## Two bindings files, one per ABI
+
+          \`winpr/wtypes.h\` typedefs \`BOOL\` to \`int32_t\` off Apple and to a one-byte value on
+          it, so the same headers describe a different ABI on each platform — in the return type
+          of nearly every FreeRDP function. There are therefore two committed bindings files,
+          selected by \`cfg\`, each generated and checked on its own platform.
+
+          ## Checking what you downloaded
+
+          \`\`\`
+          curl -sSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
+
+          \`build.rs\` does the same thing automatically for the archive it fetches, then hashes
+          every extracted \`.a\` against the \`sha256(lib/…)\` lines in that archive's own
+          MANIFEST. Both are corruption checks — SHA256SUMS is published on the same release as
+          the files it covers — and both need no API call.
+
+          Those \`sha256(lib/…)\` lines are also the interesting ones to compare *between*
+          releases. On \`linux-x86_64\` the pipeline builds twice and requires the two to match,
+          so two releases of the same FreeRDP with the same flags list the same hashes. macOS is
+          not byte-reproducible — Apple's \`ar\` has no deterministic mode — and that is measured
+          rather than claimed either way.
+
+          ## Licensing
+
+          FreeRDP is **Apache-2.0**, and so is OpenSSL 3. Both licence texts ship inside every
+          archive and sit at the repository root.
+          EOF
+          gh release edit "$TAG" --notes-file notes.md
+
+      # Last, and only now does the git tag come into existence.
+      - name: Publish (removes the draft, creates the tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
+          echo "published ${{ needs.prepare.outputs.tag }}"
