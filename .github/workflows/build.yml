@@ -169,16 +169,31 @@ jobs:
               echo "::error::could not start the xrdp container"
               exit 1
             }
-          # Poll rather than sleep: a fixed wait is either too short on a slow runner or wasted on
-          # a fast one, and the thing being waited for is observable.
-          for _ in $(seq 1 60); do
-            if timeout 1 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/3389' 2>/dev/null; then
-              echo "xrdp is listening"
-              exit 0
+          # **Polled from inside the container, and that is the whole point of this step.**
+          # Checking `127.0.0.1:3389` on the *host* proves nothing: `-p 3389:3389` makes Docker's
+          # own forwarder bind that port the moment the container is created, whether or not
+          # anything inside it is listening. This job connected 60 ms after that check passed and
+          # was reset mid-negotiation; the container's entire log at that moment was "Adding group
+          # `ubuntu' ... Done." — xrdp had not started at all.
+          #
+          # So: wait for xrdp itself to be bound in the container's own network namespace, then
+          # confirm the publish works from out here. Two things, because they are two claims.
+          for _ in $(seq 1 90); do
+            if docker exec xrdp bash -c 'exec 3<>/dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+              echo "xrdp is listening inside the container"
+              for _ in $(seq 1 15); do
+                if timeout 1 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/3389' 2>/dev/null; then
+                  echo "and reachable through the published port"
+                  exit 0
+                fi
+                sleep 1
+              done
+              echo "::error::xrdp is up but 3389 is not published to the host"
+              exit 1
             fi
             sleep 2
           done
-          echo "::error::xrdp never started listening on 3389"
+          echo "::error::xrdp never started listening on 3389 inside the container"
           docker logs xrdp
           exit 1
 
