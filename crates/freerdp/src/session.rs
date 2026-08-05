@@ -361,7 +361,7 @@ struct Bridge {
     resize_ready: bool,
     /// The most recent size asked for before the channel was ready — only the most recent, since
     /// a resize supersedes every earlier one rather than queueing behind it.
-    pending_resize: Option<(u32, u32)>,
+    pending_resize: Option<(u32, u32, u32)>,
 }
 
 impl Bridge {
@@ -773,9 +773,9 @@ unsafe fn execute(ctx: *mut sys::rdpContext, command: Command) {
             // SAFETY: `ctx` is live and connected, so `gdi` exists.
             unsafe { send_refresh(ctx) };
         }
-        Command::Resize { width, height } => {
+        Command::Resize { width, height, scale_percent } => {
             // SAFETY: as above.
-            unsafe { request_resize(ctx, width, height) };
+            unsafe { request_resize(ctx, width, height, scale_percent) };
         }
         Command::ClipboardAdvertise(formats) => {
             // SAFETY: as above.
@@ -826,7 +826,12 @@ unsafe fn send_refresh(ctx: *mut sys::rdpContext) {
 /// # Safety
 ///
 /// `ctx` must be live and connected.
-unsafe fn request_resize(ctx: *mut sys::rdpContext, width: u32, height: u32) {
+unsafe fn request_resize(
+    ctx: *mut sys::rdpContext,
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+) {
     // SAFETY: the caller guarantees the context.
     let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
     if bridge.disp.is_null() || !bridge.resize_ready {
@@ -835,12 +840,12 @@ unsafe fn request_resize(ctx: *mut sys::rdpContext, width: u32, height: u32) {
         // first request would leave the desktop at the size `Connect` asked for with no way to
         // tell why. A session that never gets the channel drops it, which is what
         // `Event::ResizeReady` is for.
-        bridge.pending_resize = Some((width, height));
+        bridge.pending_resize = Some((width, height, scale_percent));
         return;
     }
     // SAFETY: `disp` was stored by `channel_connected` and cleared by `channel_disconnected`, so
     // a non-null one here is live.
-    unsafe { send_monitor_layout(bridge.disp, width, height) };
+    unsafe { send_monitor_layout(bridge.disp, width, height, scale_percent) };
 }
 
 /// Build a one-monitor layout and send it.
@@ -848,14 +853,22 @@ unsafe fn request_resize(ctx: *mut sys::rdpContext, width: u32, height: u32) {
 /// # Safety
 ///
 /// `disp` must be a live display-control context whose channel is open.
-unsafe fn send_monitor_layout(disp: *mut sys::DispClientContext, width: u32, height: u32) {
+unsafe fn send_monitor_layout(
+    disp: *mut sys::DispClientContext,
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+) {
     // SAFETY: the caller guarantees the context; the send is synchronous and copies the layout.
     unsafe {
         let Some(send) = (*disp).SendMonitorLayout else { return };
-        let mut layout = monitor_layout(width, height);
+        let mut layout = monitor_layout(width, height, scale_percent);
         let status = send(disp, 1, &mut layout);
         if status != sys::CHANNEL_RC_OK {
-            eprintln!("freerdp: a monitor layout of {width}x{height} was rejected ({status})");
+            eprintln!(
+                "freerdp: a monitor layout of {width}x{height} at {scale_percent}% was rejected \
+                 ({status})"
+            );
         }
     }
 }
@@ -867,12 +880,22 @@ unsafe fn send_monitor_layout(disp: *mut sys::DispClientContext, width: u32, hei
 /// DPI. A headless client has no display and no honest answer, and the field only feeds the
 /// remote's DPI heuristics. Both xrdp and a Windows 11 host accept a layout with them zeroed.
 ///
-/// The two scale factors are **100**, not zero, and that is not the same decision. The spec
-/// constrains them — `DesktopScaleFactor` to 100..=500 and `DeviceScaleFactor` to 100, 140 or 180
-/// — so zero is out of range in a way an unknown physical size is not, and a server is entitled
-/// to discard the whole PDU over it. 100 is "no scaling", which is exactly what a caller asking
-/// for a pixel size means, and it is what FreeRDP's own clients default to.
-fn monitor_layout(width: u32, height: u32) -> sys::DISPLAY_CONTROL_MONITOR_LAYOUT {
+/// Neither scale factor is ever zero, and that is not the same decision. The spec constrains them
+/// — `DesktopScaleFactor` to 100..=500 and `DeviceScaleFactor` to 100, 140 or 180 — so zero is out
+/// of range in a way an unknown physical size is not, and a server that finds *either* out of
+/// range must ignore **both**. That is why an invented density costs the whole scaling of a
+/// desktop rather than part of it.
+///
+/// `DesktopScaleFactor` is the caller's, clamped before it gets here. `DeviceScaleFactor` is
+/// pinned to 100 whatever it is — what FreeRDP's own SDL clients send for a 2x display, and what
+/// IronRDP pins it to unconditionally. The two describe different things: how large the remote
+/// should draw its UI, and what a physical device reports about itself. A headless client has an
+/// answer for the first and none at all for the second.
+fn monitor_layout(
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+) -> sys::DISPLAY_CONTROL_MONITOR_LAYOUT {
     sys::DISPLAY_CONTROL_MONITOR_LAYOUT {
         Flags: sys::DISPLAY_CONTROL_MONITOR_PRIMARY,
         Left: 0,
@@ -882,7 +905,7 @@ fn monitor_layout(width: u32, height: u32) -> sys::DISPLAY_CONTROL_MONITOR_LAYOU
         PhysicalWidth: 0,
         PhysicalHeight: 0,
         Orientation: 0,
-        DesktopScaleFactor: 100,
+        DesktopScaleFactor: scale_percent,
         DeviceScaleFactor: 100,
     }
 }
@@ -1350,8 +1373,8 @@ unsafe extern "C" fn display_control_caps(
         // It does not make the resize *land*. A Windows host ignores a layout sent this early in
         // a session whatever thread it came from; that is measured, and `Input::resize` carries
         // the numbers and says whose job the retry is.
-        if let Some((width, height)) = bridge.pending_resize.take() {
-            bridge.shared.push(Command::Resize { width, height });
+        if let Some((width, height, scale_percent)) = bridge.pending_resize.take() {
+            bridge.shared.push(Command::Resize { width, height, scale_percent });
         }
         sys::CHANNEL_RC_OK
     })
@@ -1678,12 +1701,15 @@ mod tests {
     /// sends, and comes back as a desktop of some other size.
     #[test]
     fn the_monitor_layout_describes_one_primary_monitor() {
-        let layout = monitor_layout(1280, 800);
+        let layout = monitor_layout(1280, 800, 200);
         assert_eq!(layout.Flags, sys::DISPLAY_CONTROL_MONITOR_PRIMARY);
         assert_eq!((layout.Width, layout.Height), (1280, 800));
         assert_eq!((layout.Left, layout.Top), (0, 0));
         // Zero is the protocol's "unknown", and the reason is on `monitor_layout`.
         assert_eq!((layout.PhysicalWidth, layout.PhysicalHeight), (0, 0));
+        // The caller's density, and the pinned companion that is not the same field.
+        assert_eq!(layout.DesktopScaleFactor, 200);
+        assert_eq!(layout.DeviceScaleFactor, 100);
         assert_eq!(std::mem::size_of_val(&layout) as u32, sys::DISPLAY_CONTROL_MONITOR_LAYOUT_SIZE);
     }
 

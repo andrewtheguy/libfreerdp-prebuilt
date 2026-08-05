@@ -33,7 +33,7 @@ pub(crate) enum Command {
     /// Ask the server to resend a region — used after a client-side framebuffer reset.
     Refresh,
     /// Ask the server for a new desktop size, over `disp`.
-    Resize { width: u32, height: u32 },
+    Resize { width: u32, height: u32, scale_percent: u32 },
     ClipboardAdvertise(Vec<ClipboardFormat>),
     ClipboardRequest(u32),
     ClipboardRespond { format: u32, data: Option<Vec<u8>> },
@@ -175,17 +175,23 @@ impl Input {
     /// do it, because a retry ladder needs a clock and a policy, and both belong to whoever owns
     /// the timers — not to a queue drained by FreeRDP's event loop.
     ///
-    /// The size is adjusted to what MS-RDPEDISP permits before it is queued; see
-    /// [`sanitise_size`].
+    /// `scale_percent` is the desktop's **DesktopScaleFactor**: 100 for an ordinary display and
+    /// 200 for a 2x one, being how large the remote should draw its own UI. It rides the same PDU
+    /// as the size and cannot be sent without one, which is why it is an argument here rather than
+    /// a call of its own — a size sent without it tells the server to forget a scale it is already
+    /// applying, and a client that alternated the two would fight itself.
+    ///
+    /// The size and the scale are adjusted to what MS-RDPEDISP permits before they are queued; see
+    /// [`sanitise_size`] and [`sanitise_scale`].
     ///
     /// This does not rate-limit. A window being dragged produces a resize per frame, and every
     /// one of them costs the remote a full desktop renegotiation — so a caller driving this from
     /// a viewport needs to debounce, and only the caller knows what its own idle looks like.
     /// FreeRDP's own X11 client debounces at 200 ms (`xf_disp.c`, `RESIZE_MIN_DELAY_NS`), which is
     /// a reasonable place to start.
-    pub fn resize(&self, width: u32, height: u32) {
+    pub fn resize(&self, width: u32, height: u32, scale_percent: u32) {
         let (width, height) = sanitise_size(width, height);
-        self.push(Command::Resize { width, height });
+        self.push(Command::Resize { width, height, scale_percent: sanitise_scale(scale_percent) });
     }
 
     fn mouse(&self, flags: u16, x: u16, y: u16) {
@@ -216,6 +222,17 @@ pub(crate) fn sanitise_size(width: u32, height: u32) -> (u32, u32) {
     let height =
         height.clamp(sys::DISPLAY_CONTROL_MIN_MONITOR_HEIGHT, sys::DISPLAY_CONTROL_MAX_MONITOR_HEIGHT);
     (width, height)
+}
+
+/// Bring a requested `DesktopScaleFactor` inside the 100..=500 MS-RDPEDISP allows.
+///
+/// Clamped rather than refused for the same reason as the size, and with a sharper consequence: a
+/// server that finds *either* scale factor out of range must ignore **both**, so an invented
+/// density does not cost part of the request — it costs the whole scaling of the desktop, silently.
+/// A caller that means "no scaling" should pass 100; 0 is the same request, badly spelled, and
+/// becomes 100 here.
+pub(crate) fn sanitise_scale(percent: u32) -> u32 {
+    percent.clamp(100, 500)
 }
 
 #[cfg(test)]
@@ -274,6 +291,19 @@ mod tests {
         for (width, _) in [sanitise_size(0, 600), sanitise_size(u32::MAX, 600), sanitise_size(1, 1)]
         {
             assert_eq!(width % 2, 0, "the clamp produced an odd width");
+        }
+    }
+
+    /// Out of range is not "the density is ignored" but "the desktop is not scaled at all", so
+    /// nothing may leave here outside the window the spec allows.
+    #[test]
+    fn a_scale_factor_cannot_leave_the_range_that_makes_it_legal() {
+        assert_eq!(sanitise_scale(100), 100, "no scaling");
+        assert_eq!(sanitise_scale(200), 200, "a 2x display");
+        assert_eq!(sanitise_scale(0), 100, "\"unset\" is the same request, badly spelled");
+        assert_eq!(sanitise_scale(u32::MAX), 500);
+        for percent in [0, 1, 99, 100, 250, 500, 501, 10_000, u32::MAX] {
+            assert!((100..=500).contains(&sanitise_scale(percent)), "{percent}");
         }
     }
 

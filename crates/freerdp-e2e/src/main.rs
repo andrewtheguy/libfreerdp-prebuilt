@@ -196,9 +196,14 @@ fn resize_check(
     // deliberately *odd* — 801 is what a real viewport produces, and the width must be even on the
     // wire. If `sanitise_size` did not round it down, this is where a Windows host silently
     // ignores the layout and the resize never arrives.
-    let (want_width, want_height) = (801, 600);
-    println!("resize          asking for {want_width}x{want_height}");
-    session.input().resize(want_width, want_height);
+    // 200% rather than the neutral 100, and that is an assertion rather than a flourish: a server
+    // that finds either scale factor out of range must ignore *both*, which means discarding the
+    // whole layout — so a resize that lands at all is proof the density reached the right field
+    // with a legal value in it. There is nothing else to check it against, since no PDU reports
+    // back what scale a server settled on.
+    let (want_width, want_height, want_scale) = (801, 600, 200);
+    println!("resize          asking for {want_width}x{want_height} at {want_scale}%");
+    session.input().resize(want_width, want_height, want_scale);
     let asked = Instant::now();
 
     let mut ready = ready;
@@ -216,7 +221,7 @@ fn resize_check(
                 // viewport must also do. See `Input::resize`.
                 if ready {
                     println!("resize          asking again, {:?} in", asked.elapsed());
-                    session.input().resize(want_width, want_height);
+                    session.input().resize(want_width, want_height, want_scale);
                 }
                 continue;
             }
@@ -253,7 +258,8 @@ fn resize_check(
     assert!(
         !ready,
         "the server offered DisplayControl and then ignored a layout for \
-         {want_width}x{want_height} — the desktop is still {width}x{height} after 30 s"
+         {want_width}x{want_height} at {want_scale}% — the desktop is still {width}x{height} \
+         after 45 s"
     );
     println!("resize          skipped — this server does not offer DisplayControl");
 }
