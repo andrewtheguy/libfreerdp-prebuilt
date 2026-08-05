@@ -1,0 +1,16 @@
+name: CI
+
+# Placeholder. The real workflow lands with the code it is meant to gate — there is nothing to
+# shellcheck, clippy or build yet, and a workflow that runs on every push before then would be a
+# red X against a repository that contains a README.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "CI is not wired up yet."

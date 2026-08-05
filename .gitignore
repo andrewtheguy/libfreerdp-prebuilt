@@ -1,0 +1,19 @@
+# Fetched tarballs, source trees, build trees, and the libraries themselves. Nothing built
+# belongs in git: the point of this repo is that the *release assets* are the artifacts, and a
+# committed .a is one nobody can tell apart from the one CI made.
+build/
+dist/
+.DS_Store
+
+# The same rule, applied to the Rust half. `prebuilt/` is a cache: ./sync-prebuilt.sh fills it
+# from dist/, and failing that crates/freerdp-prebuilt-sys/build.rs downloads what it needs from
+# the latest release. Nothing about which bytes are correct is stored here — that travels with
+# the archives, as SHA256SUMS and each archive's own MANIFEST.
+crates/freerdp-prebuilt-sys/prebuilt/
+target/
+Cargo.lock
+
+# Per-checkout notes for Claude Code: what this particular machine can and cannot build. All of
+# it is true of one developer's setup rather than of the project; anything that holds for
+# everyone belongs in a committed CLAUDE.md instead.
+CLAUDE.local.md

@@ -1,0 +1,16 @@
+name: Build FreeRDP
+
+# Placeholder. This is where the archives get built and tested; it is manual-only until there is
+# a build.sh for it to call, so that the file can exist — and be referenced by the others — before
+# it does anything.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Nothing to build yet."

@@ -1,0 +1,16 @@
+name: Release FreeRDP archives
+
+# Placeholder. Publishing stays manual and stays separate from building, so that "does this build
+# and pass" can be asked without anybody being committed to a release by asking. There is nothing
+# to publish yet.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Nothing to release yet."
