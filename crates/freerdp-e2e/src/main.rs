@@ -252,12 +252,14 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     session.input().key(0x1C, false, true);
     session.input().key(0x1C, false, false);
 
-    // The resize leg runs first because it is the long one, and the sound channel needs that time:
-    // `rdpsnd` comes up after the first paints, and a desktop has to make a noise before there is
-    // anything to count. But its verdict is *held* rather than thrown, so that a host which
+    // The resize leg runs first because it is usually the long one, and the sound channel needs
+    // that time: `rdpsnd` comes up after the first paints, and a desktop has to make a noise before
+    // there is anything to count. Usually, not always — hence `await_audio` after it, for the host
+    // that resizes at once. The resize verdict is *held* rather than thrown, so that a host which
     // ignores layouts — which is a fact about the host, and a known one — does not swallow the
     // audio report on the way out.
     let resize_failure = resize_check(&session, &events, resize_ready, width, height);
+    await_audio(&recorder, &events);
     audio_check(&recorder);
     if let Some(why) = resize_failure {
         panic!("{why}");
@@ -265,6 +267,31 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
 
     session.shutdown();
     println!("disconnected    cleanly");
+}
+
+/// Give `rdpsnd` until a deadline to say whether it negotiated, so that "not offered" below is a
+/// verdict rather than a race.
+///
+/// The resize leg is the long one, but only when the server makes it long: it returns the moment a
+/// resize arrives, which against a prompt host can be a second in — early enough that a sound
+/// channel still coming up would be reported as one the server never offered at all. So the wait
+/// belongs here, where it can end as soon as `negotiated` fires.
+///
+/// Events are drained rather than slept through. The session runs on its own thread and this is the
+/// only reader of its queue; letting that queue grow for the length of the wait would leave the
+/// shutdown below with a backlog to walk and prove nothing.
+fn await_audio(recorder: &Recorder, events: &std::sync::mpsc::Receiver<Event>) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while recorder.accepted.load(Ordering::Relaxed) == usize::MAX && Instant::now() < deadline {
+        match events.recv_timeout(Duration::from_secs(1)) {
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            // The session thread is gone, so nothing more can negotiate. Nothing is reported here:
+            // an `Ended` is the resize leg's to complain about, and what this leg has to say about
+            // a session that never came up is exactly what `audio_check` says next.
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// What the sound channel did, and what can honestly be asserted about it.
