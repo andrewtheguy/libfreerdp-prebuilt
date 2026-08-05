@@ -89,7 +89,7 @@ mod session;
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardFormat};
 pub use error::Error;
 pub use framebuffer::{Frame, Framebuffer, Rect};
-pub use input::{Input, MouseButton};
+pub use input::{sanitise_scale, sanitise_size, Input, MouseButton};
 pub use pointer::{Cursor, CursorImage};
 pub use session::{Connect, Event, KeepAlive, Security, Session};
 

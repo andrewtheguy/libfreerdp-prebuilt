@@ -205,6 +205,11 @@ impl Input {
 
 /// Bring a requested desktop size inside what MS-RDPEDISP allows.
 ///
+/// Public because a caller that decides *whether to ask at all* has to compare against the size
+/// that would really be sent. Asking a server for the desktop it already has is not free — it
+/// answers with a full session renegotiation — so a client that compares an unadjusted 1281 against
+/// a live 1280 asks again on every viewport report, forever.
+///
 /// Adjusted rather than refused, and that is the considered choice. A caller sizing a desktop to
 /// a viewport has an arbitrary number of pixels, and every constraint below is one it cannot do
 /// anything about — refusing a resize because a window happens to be 1281 pixels wide would be a
@@ -215,7 +220,7 @@ impl Input {
 /// - **The width must be even** (MS-RDPEDISP 2.2.2.2.1). Rounded *down*, so the desktop stays
 ///   inside the viewport that asked for it rather than growing a scrollbar by one pixel.
 /// - Both dimensions are clamped to 200..=8192, the `DISPLAY_CONTROL_MIN/MAX_MONITOR_*` bounds.
-pub(crate) fn sanitise_size(width: u32, height: u32) -> (u32, u32) {
+pub fn sanitise_size(width: u32, height: u32) -> (u32, u32) {
     let width = width
         .clamp(sys::DISPLAY_CONTROL_MIN_MONITOR_WIDTH, sys::DISPLAY_CONTROL_MAX_MONITOR_WIDTH)
         & !1;
@@ -231,7 +236,7 @@ pub(crate) fn sanitise_size(width: u32, height: u32) -> (u32, u32) {
 /// density does not cost part of the request — it costs the whole scaling of the desktop, silently.
 /// A caller that means "no scaling" should pass 100; 0 is the same request, badly spelled, and
 /// becomes 100 here.
-pub(crate) fn sanitise_scale(percent: u32) -> u32 {
+pub fn sanitise_scale(percent: u32) -> u32 {
     percent.clamp(100, 500)
 }
 
