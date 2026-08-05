@@ -54,6 +54,15 @@
 // `target_vendor` rather than `target_os`, so iOS and the simulator select the Apple ABI too —
 // there are no archives for them, but the wrong bindings would be a worse error message than the
 // one `build.rs` gives.
+// **`unnecessary_transmutes` is a rustc lint, not a clippy one**, so the `#![allow(clippy::all)]`
+// bindgen writes into each generated file does not cover it and `-D warnings` turns it into a
+// failed build. It fires in `bindings_linux.rs` and *not* in `bindings_apple.rs`, which is the
+// two-ABI split above showing up in a place nobody would predict: `BOOL` is `int32_t` on Linux, so
+// bindgen's bitfield accessors transmute `i32` to `u32`, while on Apple it is a one-byte type and
+// no transmute is generated at all. Generated code is not ours to lint, and this is the item that
+// covers both files. `unknown_lints` first, so a toolchain predating the lint is not itself a
+// warning — this crate's MSRV is older than the lint.
+#[allow(unknown_lints, unnecessary_transmutes)]
 #[cfg_attr(target_vendor = "apple", path = "bindings_apple.rs")]
 #[cfg_attr(not(target_vendor = "apple"), path = "bindings_linux.rs")]
 mod bindings;

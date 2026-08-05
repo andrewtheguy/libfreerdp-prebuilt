@@ -46,7 +46,11 @@ is only the things that are easy to get wrong.
   the caller — `crates/freerdp` does not have one, and `freerdp-e2e` shows the shape.
 - **`BOOL` is a different size on Apple and Linux**, so there are two committed bindings files and
   each can only be regenerated on its own platform. `gen-bindings.sh --check` says out loud that
-  it did not check the other one.
+  it did not check the other one. That split shows up in unpredictable places: `bindings_linux.rs`
+  trips rustc's `unnecessary_transmutes` and `bindings_apple.rs` does not, because a four-byte
+  `BOOL` makes bindgen transmute in its bitfield accessors and a one-byte one does not. **A local
+  `cargo clippy` on this Mac cannot see anything wrong with the Linux bindings**, and that is the
+  general case rather than that one lint.
 - **bindgen carries on without rustfmt**, emitting a complete but unformatted file — 16 enormous
   lines instead of 30,000 — with only a warning. `gen-bindings.sh` requires rustfmt and asserts a
   floor on the output size for that reason.
