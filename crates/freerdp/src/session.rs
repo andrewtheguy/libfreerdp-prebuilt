@@ -635,6 +635,24 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         (U::FreeRDP_TcpKeepAliveInterval, seconds(config.keepalive.interval)),
         (U::FreeRDP_TcpKeepAliveRetries, config.keepalive.retries),
         (U::FreeRDP_TcpAckTimeout, millis(config.keepalive.ack_timeout)),
+        // **The link is a LAN, and we say so rather than letting the server measure it.**
+        //
+        // FreeRDP defaults this to `CONNECTION_TYPE_AUTODETECT` with
+        // `NetworkAutoDetect` on, which turns on MS-RDPBCGR's Network Characteristics
+        // Detection: the server times round trips and a bandwidth payload, and paces
+        // its own updates from the answer. Measured against a Windows 11 host over a
+        // tunnelled IPv6 link, that pacing collapsed — a five-second scripted drag
+        // arrived in as few as 12 batches, with 95% of its 100 ms buckets carrying no
+        // update at all, and whole seconds in which the server sent nothing while the
+        // client sent 56 input events. The same drag against xrdp, which implements no
+        // auto-detect, painted continuously throughout.
+        //
+        // A gateway is not a laptop on hotel wifi: it sits beside the hosts it serves
+        // and re-encodes for whatever link the *browser* is on, which this end already
+        // paces itself. So the server's estimate of *this* hop is both wrong and
+        // unhelpful, and the honest thing is to declare the link rather than have it
+        // guessed at.
+        (U::FreeRDP_ConnectionType, sys::CONNECTION_TYPE_LAN),
     ];
     for (key, value) in uints {
         // SAFETY: `settings` is live; these keys are all UInt32 keys by construction.
@@ -658,6 +676,10 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // on lets a server talk this client into a mode it was explicitly not given.
         (B::FreeRDP_NegotiateSecurityLayer, config.security == Security::Auto),
         (B::FreeRDP_TcpKeepAlive, true),
+        // The other half of the LAN declaration above: with auto-detect on, the
+        // `ConnectionType` is only a starting guess the server then overrides with what
+        // it measured, so leaving this true would give the throttling back.
+        (B::FreeRDP_NetworkAutoDetect, false),
         (B::FreeRDP_RedirectClipboard, config.clipboard),
         // Software GDI: FreeRDP decodes into `gdi->primary_buffer` rather than into a hardware
         // surface. That *is* the headless path — `gdi_init` below has nothing to draw on
@@ -698,9 +720,16 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // supported, and what every real client asks for.
         (B::FreeRDP_FastPathInput, true),
         (B::FreeRDP_FastPathOutput, true),
-        // Desktop composition and animation cost bandwidth to send and mean nothing to a
-        // consumer encoding the result.
-        (B::FreeRDP_DisableFullWindowDrag, true),
+        // **Full window drag stays on**, which is what a LAN declaration means. Turned
+        // off, Windows draws a rubber-band outline instead of the window while it is
+        // being dragged — and on a remote desktop that does not read as a bandwidth
+        // saving, it reads as the drag having stopped working. It is the same fault the
+        // `ConnectionType` above was measured against, seen by a person rather than by a
+        // probe, and asking for it while declaring a LAN would be this crate arguing
+        // with itself.
+        (B::FreeRDP_DisableFullWindowDrag, false),
+        // Menu fades do not survive being re-encoded as tiles well enough to be worth
+        // the frames, and nothing about them is load-bearing the way a drag is.
         (B::FreeRDP_DisableMenuAnims, true),
         // Themes are *not* disabled: an unthemed Windows desktop is jarring in a way that reads
         // as a broken client rather than as a bandwidth saving.
