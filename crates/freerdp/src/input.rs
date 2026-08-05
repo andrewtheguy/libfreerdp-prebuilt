@@ -32,6 +32,8 @@ pub(crate) enum Command {
     LockKeys { flags: u32 },
     /// Ask the server to resend a region — used after a client-side framebuffer reset.
     Refresh,
+    /// Ask the server for a new desktop size, over `disp`.
+    Resize { width: u32, height: u32 },
     ClipboardAdvertise(Vec<ClipboardFormat>),
     ClipboardRequest(u32),
     ClipboardRespond { format: u32, data: Option<Vec<u8>> },
@@ -150,6 +152,42 @@ impl Input {
         self.push(Command::Refresh);
     }
 
+    /// Ask the server to change the desktop size.
+    ///
+    /// Needs [`Connect::resize`](crate::Connect::resize) and a server that offers DisplayControl —
+    /// which is announced as [`Event::ResizeReady`](crate::Event::ResizeReady). A request made
+    /// before that arrives is *held*, not dropped, and the most recent one is sent as soon as the
+    /// channel comes up; a request made on a session that never gets the channel is dropped, like
+    /// every other input on a session that cannot carry it.
+    ///
+    /// **Nothing happens synchronously.** The server answers by renegotiating the desktop, which
+    /// arrives as [`Event::Resize`](crate::Event::Resize) with the size it actually chose — which
+    /// may not be the size asked for, and on a server that declines is never sent at all. So the
+    /// framebuffer's size is what `Event::Resize` says, never what was requested here.
+    ///
+    /// **A single request is not enough, and a caller that sends one and waits will sometimes wait
+    /// forever.** A Windows 11 host ignores a monitor layout that arrives while it is still
+    /// bringing the session up, and reports nothing at all about having ignored it — measured:
+    /// the same 800x600 layout was dropped 400 ms after that host's own capabilities PDU and
+    /// honoured 6.7 s into the same session, byte for byte identical on the wire both times. There
+    /// is no "ready now" to wait for, so **the retry belongs to the caller**: ask again until
+    /// [`Event::Resize`](crate::Event::Resize) arrives or the caller gives up. This crate does not
+    /// do it, because a retry ladder needs a clock and a policy, and both belong to whoever owns
+    /// the timers — not to a queue drained by FreeRDP's event loop.
+    ///
+    /// The size is adjusted to what MS-RDPEDISP permits before it is queued; see
+    /// [`sanitise_size`].
+    ///
+    /// This does not rate-limit. A window being dragged produces a resize per frame, and every
+    /// one of them costs the remote a full desktop renegotiation — so a caller driving this from
+    /// a viewport needs to debounce, and only the caller knows what its own idle looks like.
+    /// FreeRDP's own X11 client debounces at 200 ms (`xf_disp.c`, `RESIZE_MIN_DELAY_NS`), which is
+    /// a reasonable place to start.
+    pub fn resize(&self, width: u32, height: u32) {
+        let (width, height) = sanitise_size(width, height);
+        self.push(Command::Resize { width, height });
+    }
+
     fn mouse(&self, flags: u16, x: u16, y: u16) {
         self.push(Command::Mouse { flags, x, y });
     }
@@ -157,6 +195,27 @@ impl Input {
     pub(crate) fn push(&self, command: Command) {
         self.shared.push(command);
     }
+}
+
+/// Bring a requested desktop size inside what MS-RDPEDISP allows.
+///
+/// Adjusted rather than refused, and that is the considered choice. A caller sizing a desktop to
+/// a viewport has an arbitrary number of pixels, and every constraint below is one it cannot do
+/// anything about — refusing a resize because a window happens to be 1281 pixels wide would be a
+/// bug with no fix at the call site. The server's answer arrives as
+/// [`Event::Resize`](crate::Event::Resize) and carries the size it really chose, so nothing here
+/// is the caller's last word on the matter.
+///
+/// - **The width must be even** (MS-RDPEDISP 2.2.2.2.1). Rounded *down*, so the desktop stays
+///   inside the viewport that asked for it rather than growing a scrollbar by one pixel.
+/// - Both dimensions are clamped to 200..=8192, the `DISPLAY_CONTROL_MIN/MAX_MONITOR_*` bounds.
+pub(crate) fn sanitise_size(width: u32, height: u32) -> (u32, u32) {
+    let width = width
+        .clamp(sys::DISPLAY_CONTROL_MIN_MONITOR_WIDTH, sys::DISPLAY_CONTROL_MAX_MONITOR_WIDTH)
+        & !1;
+    let height =
+        height.clamp(sys::DISPLAY_CONTROL_MIN_MONITOR_HEIGHT, sys::DISPLAY_CONTROL_MAX_MONITOR_HEIGHT);
+    (width, height)
 }
 
 #[cfg(test)]
@@ -200,6 +259,21 @@ mod tests {
             let flags = wheel_flags(delta, false);
             let event_bits = flags & !sys::WheelRotationMask;
             assert_eq!(event_bits, sys::PTR_FLAGS_WHEEL, "delta {delta} corrupted the event bits");
+        }
+    }
+
+    /// Every one of these is a size a viewport really produces, and an odd width is the one that
+    /// fails *silently* on a Windows host — the layout is accepted and the desktop never changes.
+    #[test]
+    fn a_requested_size_is_brought_inside_what_the_protocol_allows() {
+        assert_eq!(sanitise_size(1281, 800), (1280, 800), "an odd width rounds down");
+        assert_eq!(sanitise_size(1920, 1080), (1920, 1080), "a legal size is left alone");
+        assert_eq!(sanitise_size(0, 0), (200, 200), "below the minimum");
+        assert_eq!(sanitise_size(u32::MAX, u32::MAX), (8192, 8192), "above the maximum");
+        // The clamp must not reintroduce an odd width at either end.
+        for (width, _) in [sanitise_size(0, 600), sanitise_size(u32::MAX, 600), sanitise_size(1, 1)]
+        {
+            assert_eq!(width % 2, 0, "the clamp produced an odd width");
         }
     }
 

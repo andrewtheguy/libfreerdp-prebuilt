@@ -1,6 +1,6 @@
 //! A safe, **headless** RDP client over FreeRDP 3.
 //!
-//! Screen, cursor, keyboard, mouse and clipboard, and nothing else. There is no window, no
+//! Screen, cursor, keyboard, mouse, clipboard and resize, and nothing else. There is no window, no
 //! toolkit and no drawing: [`Session::start`] connects, keeps a complete framebuffer up to date
 //! in Rust-owned memory, and posts an [`Event`] whenever a rectangle of it changes. What the
 //! caller does with those pixels — encode them, diff them, throw them away — is not this crate's
@@ -56,13 +56,17 @@
 //! # What this does not do
 //!
 //! - **No audio.** The archives carry `rdpsnd`, and nothing here binds it.
-//! - **No dynamic resize.** The archives carry `disp` too; the same applies.
 //! - **No graphics pipeline.** `FreeRDP_SupportGraphicsPipeline` is set to `FALSE`, deliberately
 //!   and with a measurement behind it — see [`Connect`].
 //! - **No certificate verification.** Also deliberate, also documented on [`Connect`]. Read that
 //!   before using this on a network you do not control.
 //! - **No file-transfer clipboard.** Formats and their bytes cross; `CB_STREAM_FILECLIP_ENABLED`
 //!   is not advertised, so a copied *file* stays where it is.
+//! - **No multiple monitors.** [`Input::resize`] sends a layout of exactly one, and the desktop is
+//!   one framebuffer. MS-RDPEDISP carries up to sixteen and this crate uses one of them.
+//! - **No resize debouncing.** [`Input::resize`] sends what it is given, and each one costs the
+//!   remote a full session renegotiation — a caller driving it from a window has to rate-limit,
+//!   and only the caller knows what its own idle looks like.
 //!
 //! # Panics and aborts
 //!

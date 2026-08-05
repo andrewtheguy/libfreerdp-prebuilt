@@ -34,9 +34,16 @@ is only the things that are easy to get wrong.
 - **The archives' channel set is frozen at configure time.** `channels/client/CMakeLists.txt`
   generates the addin table from the enabled set, so a consumer cannot turn one on later. That is
   why `rdpsnd`, `disp` and `rdpgfx` are built in even though the wrapper calls none of them.
-- **cliprdr callbacks return a channel error code, where 0 is success** — the opposite of every
-  other callback in the wrapper. Returning 1 from `MonitorReady` tears the session down and
+- **cliprdr and disp callbacks return a channel error code, where 0 is success** — the opposite of
+  every other callback in the wrapper. Returning 1 from `MonitorReady` tears the session down and
   surfaces to the caller as an orderly `Ended(Ok(()))` a second after connecting.
+- **A static channel and a dynamic one arrive under different names.** `cliprdr` is matched on its
+  8-character SVC name and `disp` on `Microsoft::Windows::RDS::DisplayControl`, which is what its
+  plugin registered. Matching a DVC on its short name compiles and never fires.
+- **A Windows host ignores a monitor layout sent early in a session, and says nothing.** Measured:
+  the same 800x600 layout dropped 400 ms after that host's own DisplayControl capabilities PDU and
+  honoured 6.7 s into the same session. There is no observable "ready now", so the retry belongs to
+  the caller — `crates/freerdp` does not have one, and `freerdp-e2e` shows the shape.
 - **`BOOL` is a different size on Apple and Linux**, so there are two committed bindings files and
   each can only be regenerated on its own platform. `gen-bindings.sh --check` says out loud that
   it did not check the other one.
@@ -57,12 +64,13 @@ cargo run --release -p freerdp-e2e -- <host> <user> <pw>   # connect, paint, dis
 ```
 
 The second form is what proves the wrapper, and there is no substitute for it: connecting,
-decoding, cursors and clipboard are all things a unit test can only pretend to exercise. Run it
-against both a Linux xrdp and a real Windows host — they fail differently, and the Windows path is
-the one with CredSSP, NTLM and the graphics-pipeline decision in it.
+decoding, cursors, clipboard and resize are all things a unit test can only pretend to exercise.
+Run it against both a Linux xrdp and a real Windows host — they fail differently, and the Windows
+path is the one with CredSSP, NTLM, the graphics-pipeline decision and the layout timing in it.
+The resize leg skips itself, loudly, against a server with no DisplayControl.
 
 ## Scope
 
 This repository builds archives and wraps them. It is not where RDP features get designed: if a
-consumer needs audio or dynamic resize, the channels are already in the archives and the work is
-new code in `crates/freerdp`, not a new build.
+consumer needs audio, the channel is already in the archives and the work is new code in
+`crates/freerdp`, not a new build. Resize went in that way and needed no new archive.

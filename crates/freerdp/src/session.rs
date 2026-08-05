@@ -90,6 +90,20 @@ pub struct Connect {
     pub security: Security,
     /// Whether to load `cliprdr`. When false there is no [`Session::clipboard`].
     pub clipboard: bool,
+    /// Whether to load `disp` and advertise DisplayControl, which is what makes
+    /// [`Input::resize`](crate::Input::resize) do anything.
+    ///
+    /// **Off by default**, unlike the clipboard, and for a reason worth knowing before turning it
+    /// on: a server answers a monitor layout by *renegotiating the whole session* — a
+    /// deactivate/reactivate sequence that tears down the desktop, the capability set and the
+    /// framebuffer and builds them again. That is by far the most disruptive thing a client can
+    /// ask for, it is where an RDP implementation is most likely to have a bug, and a client that
+    /// never asks is a client that never meets it. So it is opt-in, per session, by the embedder
+    /// that knows whether its users want the feature more than they want the session to survive.
+    ///
+    /// FreeRDP handles the reactivation itself, inside `freerdp_check_event_handles` — this crate
+    /// sees only a [`Event::Resize`] afterwards.
+    pub resize: bool,
     pub connect_timeout: Duration,
     pub keepalive: KeepAlive,
 }
@@ -106,6 +120,7 @@ impl Default for Connect {
             height: 768,
             security: Security::default(),
             clipboard: true,
+            resize: false,
             connect_timeout: Duration::from_secs(15),
             keepalive: KeepAlive::default(),
         }
@@ -124,7 +139,30 @@ pub enum Event {
     Paint(Rect),
     /// The server changed the desktop size. The framebuffer has already been resized and
     /// cleared, so everything is about to be repainted.
+    ///
+    /// Sent whether the change was asked for or not: a server may resize a session on its own —
+    /// a console session whose real display mode changed, for instance — and that arrives here
+    /// identically to the answer to an [`Input::resize`](crate::Input::resize).
+    ///
+    /// A server normally repaints after a resize, but it is not obliged to, and the framebuffer
+    /// is blank until it does. A caller that cannot show a blank desktop should follow this with
+    /// [`Input::refresh`](crate::Input::refresh) — which this crate does *not* do for it, because
+    /// the refresh must not be sent from inside the callback: this fires part-way through the
+    /// reactivation sequence, before the connection is ready to carry client PDUs. Going through
+    /// the queue puts it after that, which is why it is the caller's call and not a hidden one.
     Resize { width: u32, height: u32 },
+    /// The server offered DisplayControl, so [`Input::resize`](crate::Input::resize) now has
+    /// somewhere to go. Only ever sent on a session configured with [`Connect::resize`], and not
+    /// at all by a server that does not implement MS-RDPEDISP — which is the honest signal a
+    /// consumer needs before offering the feature to a user.
+    ///
+    /// It is **not** a promise that the next resize will be honoured: a Windows host sends this
+    /// and then ignores layouts for several seconds more, silently. That measurement, and what a
+    /// caller has to do about it, are on [`Input::resize`](crate::Input::resize).
+    ///
+    /// `max_area` is the largest total monitor area the server will accept, in pixels; this crate
+    /// asks for one monitor, so it bounds `width * height`.
+    ResizeReady { max_monitors: u32, max_area: u64 },
     Cursor(Cursor),
     Clipboard(ClipboardEvent),
     /// The session is over, and the channel is about to close. `Ok(())` is an orderly
@@ -317,6 +355,13 @@ struct Bridge {
     /// peer, so `advertise` calls that arrive early are held until this is true.
     clipboard_ready: bool,
     pending_advertise: Option<Vec<ClipboardFormat>>,
+    disp: *mut sys::DispClientContext,
+    /// Whether the server's DisplayControl capabilities have arrived. Until they do, the channel
+    /// exists but the server has not said it will listen.
+    resize_ready: bool,
+    /// The most recent size asked for before the channel was ready — only the most recent, since
+    /// a resize supersedes every earlier one rather than queueing behind it.
+    pending_resize: Option<(u32, u32)>,
 }
 
 impl Bridge {
@@ -386,6 +431,9 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         cliprdr: std::ptr::null_mut(),
         clipboard_ready: false,
         pending_advertise: None,
+        disp: std::ptr::null_mut(),
+        resize_ready: false,
+        pending_resize: None,
     }));
     // SAFETY: `ctx` is the context just created, so it is a `WrapperContext` with room for this.
     unsafe { (*(ctx as *mut WrapperContext)).bridge = bridge };
@@ -528,9 +576,17 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // understood, the legacy bitmap path is the one that works — and it is also what every
         // pure-Rust RDP client in production uses today, so this is not a step backwards.
         (B::FreeRDP_SupportGraphicsPipeline, false),
-        // No dynamic resize: `disp` is in the archive but nothing here drives it, and
-        // advertising a channel this client will not answer on invites the server to wait.
-        (B::FreeRDP_SupportDisplayControl, false),
+        // Dynamic resize. This one key is also what *loads* the channel: the addin table in
+        // `client/common/cmdline.c` maps `FreeRDP_SupportDisplayControl` to `disp`, and
+        // `freerdp_client_load_channels` — installed as `LoadChannels` by
+        // `freerdp_client_context_new` — walks it. So there is no `add_dynamic_channel` call here,
+        // exactly as there is none for the clipboard.
+        //
+        // Not paired with `FreeRDP_DynamicResolutionUpdate`, and that is deliberate rather than an
+        // omission: despite the name, that setting is xfreerdp's own — it means "let the *window*
+        // drive the resolution", and `xf_disp.c` is the only thing that reads it. A headless
+        // client has no window, and resizes when its embedder says so.
+        (B::FreeRDP_SupportDisplayControl, config.resize),
         // Refresh and suppress-output are what make `Input::refresh` and a minimised viewer
         // work; both are cheap capability bits.
         (B::FreeRDP_RefreshRect, true),
@@ -570,7 +626,8 @@ fn millis(duration: Duration) -> u32 {
     duration.as_millis().min(u32::MAX as u128) as u32
 }
 
-/// Subscribe to the channel-connected event, which is how the clipboard interface arrives.
+/// Subscribe to the channel events, which is how the clipboard and display-control interfaces
+/// arrive — and, on the other side, how this crate learns to stop using them.
 fn subscribe_channels(ctx: *mut sys::rdpContext) -> Result<(), Error> {
     // SAFETY: `ctx` is live and `pubSub` is created by `freerdp_client_context_new`.
     let pub_sub = unsafe { (*ctx).pubSub };
@@ -580,16 +637,22 @@ fn subscribe_channels(ctx: *mut sys::rdpContext) -> Result<(), Error> {
     // per-event subscribers as `static inline` functions from a macro, so they exist in no
     // archive and bindgen emits none of them. This is what the inline would have done, and the
     // event name is the string the macro stringifies.
-    let name = c"ChannelConnected";
-    // SAFETY: variadic, and the handler signature must match the event — which is why the name
-    // and the function below are chosen together and never separately.
+    //
+    // SAFETY: variadic, and the handler signature must match the event — which is why each name
+    // and the function beside it are chosen together and never separately.
     // Cast to a function *pointer*: a Rust function item is zero-sized and cannot be passed
-    // through a variadic. The signature it is cast to is the one `pChannelConnectedEventHandler`
-    // names, and nothing checks that for us — which is the whole risk of a variadic subscribe.
-    let handler: sys::pChannelConnectedEventHandler = Some(channel_connected);
-    let status = unsafe { sys::PubSub_Subscribe(pub_sub, name.as_ptr(), handler) };
-    if status < 0 {
-        return Err(Error::local("could not subscribe to the channel-connected event"));
+    // through a variadic. The signature it is cast to is the one `pChannel*EventHandler` names,
+    // and nothing checks that for us — which is the whole risk of a variadic subscribe.
+    let connected: sys::pChannelConnectedEventHandler = Some(channel_connected);
+    let disconnected: sys::pChannelDisconnectedEventHandler = Some(channel_disconnected);
+    let status = unsafe {
+        (
+            sys::PubSub_Subscribe(pub_sub, c"ChannelConnected".as_ptr(), connected),
+            sys::PubSub_Subscribe(pub_sub, c"ChannelDisconnected".as_ptr(), disconnected),
+        )
+    };
+    if status.0 < 0 || status.1 < 0 {
+        return Err(Error::local("could not subscribe to the channel events"));
     }
     Ok(())
 }
@@ -710,6 +773,10 @@ unsafe fn execute(ctx: *mut sys::rdpContext, command: Command) {
             // SAFETY: `ctx` is live and connected, so `gdi` exists.
             unsafe { send_refresh(ctx) };
         }
+        Command::Resize { width, height } => {
+            // SAFETY: as above.
+            unsafe { request_resize(ctx, width, height) };
+        }
         Command::ClipboardAdvertise(formats) => {
             // SAFETY: as above.
             unsafe { clipboard_advertise(ctx, formats) };
@@ -751,6 +818,72 @@ unsafe fn send_refresh(ctx: *mut sys::rdpContext) {
             bottom: (*gdi).height.max(0) as u16,
         };
         refresh(ctx, 1, &rect);
+    }
+}
+
+/// Ask the server for a new desktop size, or hold the request until the channel is ready.
+///
+/// # Safety
+///
+/// `ctx` must be live and connected.
+unsafe fn request_resize(ctx: *mut sys::rdpContext, width: u32, height: u32) {
+    // SAFETY: the caller guarantees the context.
+    let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
+    if bridge.disp.is_null() || !bridge.resize_ready {
+        // Held rather than sent, and only the most recent one. A caller that sizes its viewport
+        // before the channel finishes coming up is doing the normal thing, and dropping that
+        // first request would leave the desktop at the size `Connect` asked for with no way to
+        // tell why. A session that never gets the channel drops it, which is what
+        // `Event::ResizeReady` is for.
+        bridge.pending_resize = Some((width, height));
+        return;
+    }
+    // SAFETY: `disp` was stored by `channel_connected` and cleared by `channel_disconnected`, so
+    // a non-null one here is live.
+    unsafe { send_monitor_layout(bridge.disp, width, height) };
+}
+
+/// Build a one-monitor layout and send it.
+///
+/// # Safety
+///
+/// `disp` must be a live display-control context whose channel is open.
+unsafe fn send_monitor_layout(disp: *mut sys::DispClientContext, width: u32, height: u32) {
+    // SAFETY: the caller guarantees the context; the send is synchronous and copies the layout.
+    unsafe {
+        let Some(send) = (*disp).SendMonitorLayout else { return };
+        let mut layout = monitor_layout(width, height);
+        let status = send(disp, 1, &mut layout);
+        if status != sys::CHANNEL_RC_OK {
+            eprintln!("freerdp: a monitor layout of {width}x{height} was rejected ({status})");
+        }
+    }
+}
+
+/// One monitor, at the size asked for.
+///
+/// `PhysicalWidth` and `PhysicalHeight` are **zero**, which MS-RDPEDISP 2.2.2.2.1 defines as
+/// "unknown" — the alternative being to invent them, as FreeRDP's X11 client does by assuming 75
+/// DPI. A headless client has no display and no honest answer, and the field only feeds the
+/// remote's DPI heuristics. Both xrdp and a Windows 11 host accept a layout with them zeroed.
+///
+/// The two scale factors are **100**, not zero, and that is not the same decision. The spec
+/// constrains them — `DesktopScaleFactor` to 100..=500 and `DeviceScaleFactor` to 100, 140 or 180
+/// — so zero is out of range in a way an unknown physical size is not, and a server is entitled
+/// to discard the whole PDU over it. 100 is "no scaling", which is exactly what a caller asking
+/// for a pixel size means, and it is what FreeRDP's own clients default to.
+fn monitor_layout(width: u32, height: u32) -> sys::DISPLAY_CONTROL_MONITOR_LAYOUT {
+    sys::DISPLAY_CONTROL_MONITOR_LAYOUT {
+        Flags: sys::DISPLAY_CONTROL_MONITOR_PRIMARY,
+        Left: 0,
+        Top: 0,
+        Width: width,
+        Height: height,
+        PhysicalWidth: 0,
+        PhysicalHeight: 0,
+        Orientation: 0,
+        DesktopScaleFactor: 100,
+        DeviceScaleFactor: 100,
     }
 }
 
@@ -1095,10 +1228,15 @@ unsafe extern "C" fn pointer_set_position(
 
 /// The channel-connected handler, subscribed in `subscribe_channels`.
 ///
-/// Only `cliprdr` is claimed here. Everything else falls through to
+/// Only `cliprdr` and `disp` are claimed here. Everything else falls through to
 /// `freerdp_client_OnChannelConnectedEventHandler`, which is what binds `rdpgfx` to the GDI and
 /// wires up the channels this crate does not touch — so falling through is not "ignoring", it is
 /// letting FreeRDP's own client-common do the part it already does correctly.
+///
+/// The two names are matched differently for a reason that is not a style: `cliprdr` is a static
+/// virtual channel and arrives under its 8-character SVC name, while `disp` is a *dynamic* one and
+/// arrives under the long `Microsoft::Windows::RDS::DisplayControl` its plugin registered
+/// (`channels/disp/client/disp_main.c`). Matching a DVC on its short name silently never fires.
 unsafe extern "C" fn channel_connected(
     context: *mut c_void,
     e: *const sys::ChannelConnectedEventArgs,
@@ -1108,26 +1246,114 @@ unsafe extern "C" fn channel_connected(
         // SAFETY: FreeRDP passes the context this subscription was made on, and a live event.
         unsafe {
             let name = std::ffi::CStr::from_ptr((*e).name);
-            // The constant is a byte array including its NUL; `CStr::to_bytes` excludes one.
-            if name.to_bytes_with_nul() != sys::CLIPRDR_SVC_CHANNEL_NAME.as_slice() {
-                sys::freerdp_client_OnChannelConnectedEventHandler(context, e);
-                return;
-            }
+            // The constants are byte arrays including their NUL; `CStr::to_bytes` excludes one.
+            let name = name.to_bytes_with_nul();
             let Some(bridge_ref) = bridge(ctx) else { return };
-            let cliprdr = (*e).pInterface as *mut sys::CliprdrClientContext;
-            if cliprdr.is_null() {
-                return;
+
+            if name == sys::CLIPRDR_SVC_CHANNEL_NAME.as_slice() {
+                let cliprdr = (*e).pInterface as *mut sys::CliprdrClientContext;
+                if cliprdr.is_null() {
+                    return;
+                }
+                // `custom` is cliprdr's own field for exactly this — the pointer a callback uses
+                // to find its owner. guacd does the same.
+                (*cliprdr).custom = ctx as *mut c_void;
+                (*cliprdr).MonitorReady = Some(clipboard_monitor_ready);
+                (*cliprdr).ServerCapabilities = Some(clipboard_server_capabilities);
+                (*cliprdr).ServerFormatList = Some(clipboard_server_format_list);
+                (*cliprdr).ServerFormatDataRequest = Some(clipboard_server_format_data_request);
+                (*cliprdr).ServerFormatDataResponse = Some(clipboard_server_format_data_response);
+                bridge_ref.cliprdr = cliprdr;
+            } else if name == sys::DISP_DVC_CHANNEL_NAME.as_slice() {
+                let disp = (*e).pInterface as *mut sys::DispClientContext;
+                if disp.is_null() {
+                    return;
+                }
+                (*disp).custom = ctx as *mut c_void;
+                (*disp).DisplayControlCaps = Some(display_control_caps);
+                bridge_ref.disp = disp;
+                // No `resize_ready` here. The channel being open is this client's half; the
+                // server's half is the capabilities PDU, and a layout sent before it goes to a
+                // server that has not agreed to listen.
+            } else {
+                sys::freerdp_client_OnChannelConnectedEventHandler(context, e);
             }
-            // `custom` is cliprdr's own field for exactly this — the pointer a callback uses to
-            // find its owner. guacd does the same.
-            (*cliprdr).custom = ctx as *mut c_void;
-            (*cliprdr).MonitorReady = Some(clipboard_monitor_ready);
-            (*cliprdr).ServerCapabilities = Some(clipboard_server_capabilities);
-            (*cliprdr).ServerFormatList = Some(clipboard_server_format_list);
-            (*cliprdr).ServerFormatDataRequest = Some(clipboard_server_format_data_request);
-            (*cliprdr).ServerFormatDataResponse = Some(clipboard_server_format_data_response);
-            bridge_ref.cliprdr = cliprdr;
         }
+    })
+}
+
+/// The other half, and it exists to prevent a use-after-free rather than to tidy up.
+///
+/// A channel can close while the session lives on — the peer drops it, or the plugin fails — and
+/// closing it frees the interface struct. Without this, `bridge.cliprdr` and `bridge.disp` would
+/// go on pointing at freed memory, and the next `advertise` or `resize` would write through it.
+/// That is a use-after-free that would usually *work*, which is the worst kind.
+unsafe extern "C" fn channel_disconnected(
+    context: *mut c_void,
+    e: *const sys::ChannelDisconnectedEventArgs,
+) {
+    guarded("ChannelDisconnected", (), || {
+        let ctx = context as *mut sys::rdpContext;
+        // SAFETY: as in `channel_connected` — the subscription's own context and a live event.
+        unsafe {
+            let name = std::ffi::CStr::from_ptr((*e).name).to_bytes_with_nul();
+            let Some(bridge_ref) = bridge(ctx) else { return };
+
+            if name == sys::CLIPRDR_SVC_CHANNEL_NAME.as_slice() {
+                bridge_ref.cliprdr = std::ptr::null_mut();
+                bridge_ref.clipboard_ready = false;
+            } else if name == sys::DISP_DVC_CHANNEL_NAME.as_slice() {
+                bridge_ref.disp = std::ptr::null_mut();
+                bridge_ref.resize_ready = false;
+            } else {
+                sys::freerdp_client_OnChannelDisconnectedEventHandler(context, e);
+            }
+        }
+    })
+}
+
+/// The server's DisplayControl capabilities — and the moment [`Input::resize`] starts working.
+///
+/// Like the cliprdr callbacks below, this returns a **channel error code where zero is success**.
+///
+/// The two area factors multiply to give the largest total monitor area the server will accept
+/// (MS-RDPEDISP 2.2.2.1). They are reported rather than enforced: this crate asks for one monitor
+/// whose size the caller chose, and a server that dislikes it says so by not resizing, which the
+/// caller sees as the absence of an [`Event::Resize`].
+unsafe extern "C" fn display_control_caps(
+    disp: *mut sys::DispClientContext,
+    max_monitors: sys::UINT32,
+    area_factor_a: sys::UINT32,
+    area_factor_b: sys::UINT32,
+) -> sys::UINT {
+    guarded("DisplayControlCaps", sys::ERROR_INTERNAL_ERROR, || {
+        if disp.is_null() {
+            return sys::ERROR_INTERNAL_ERROR;
+        }
+        // SAFETY: `custom` holds the rdpContext `channel_connected` stored, and that context
+        // outlives the channel.
+        let ctx = unsafe { (*disp).custom } as *mut sys::rdpContext;
+        let Some(bridge) = (unsafe { bridge(ctx) }) else { return sys::CHANNEL_RC_OK };
+
+        bridge.resize_ready = true;
+        bridge.send(Event::ResizeReady {
+            max_monitors,
+            max_area: u64::from(area_factor_a) * u64::from(area_factor_b),
+        });
+
+        // Whatever was asked for before the channel existed goes back on the queue rather than
+        // being sent from here. This callback runs on the channel's own thread, part-way through
+        // handling an inbound PDU, and every other FreeRDP call in this crate is made from the
+        // event loop — putting it on the queue keeps that true for one more case rather than
+        // making this the exception.
+        //
+        // It does not make the resize *land*. A Windows host ignores a layout sent this early in
+        // a session whatever thread it came from; that is measured, and `Input::resize` carries
+        // the numbers and says whose job the retry is.
+        if let Some((width, height)) = bridge.pending_resize.take() {
+            bridge.shared.push(Command::Resize { width, height });
+        }
+        sys::CHANNEL_RC_OK
     })
 }
 
@@ -1436,11 +1662,29 @@ mod tests {
         assert_eq!(connect.port, 3389);
         assert_eq!(connect.security, Security::Auto);
         assert!(connect.clipboard);
+        // Off, and the opposite of the clipboard on purpose — a resize renegotiates the session.
+        assert!(!connect.resize);
 
         let keepalive = KeepAlive::default();
         assert_eq!(seconds(keepalive.idle), 10);
         assert_eq!(seconds(keepalive.interval), 5);
         assert_eq!(millis(keepalive.ack_timeout), 30_000);
+    }
+
+    /// The one monitor this crate ever asks for, pinned field by field.
+    ///
+    /// Worth a test rather than a read-through because `DISPLAY_CONTROL_MONITOR_LAYOUT` is ten
+    /// same-typed integers in a row: a field set in the wrong position still compiles, still
+    /// sends, and comes back as a desktop of some other size.
+    #[test]
+    fn the_monitor_layout_describes_one_primary_monitor() {
+        let layout = monitor_layout(1280, 800);
+        assert_eq!(layout.Flags, sys::DISPLAY_CONTROL_MONITOR_PRIMARY);
+        assert_eq!((layout.Width, layout.Height), (1280, 800));
+        assert_eq!((layout.Left, layout.Top), (0, 0));
+        // Zero is the protocol's "unknown", and the reason is on `monitor_layout`.
+        assert_eq!((layout.PhysicalWidth, layout.PhysicalHeight), (0, 0));
+        assert_eq!(std::mem::size_of_val(&layout) as u32, sys::DISPLAY_CONTROL_MONITOR_LAYOUT_SIZE);
     }
 
     /// A duration too large for FreeRDP's `UINT32` saturates rather than wrapping — a wrapped

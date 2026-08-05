@@ -191,7 +191,7 @@ jobs:
           \`\`\`
 
           That is the safe wrapper — a headless RDP client: connect, a Rust-owned framebuffer kept
-          up to date, damage rectangles, cursor, keyboard, mouse and clipboard. For the raw FFI,
+          up to date, damage rectangles, cursor, keyboard, mouse, clipboard and resize. For the raw FFI,
           depend on \`freerdp-prebuilt-sys\` instead; \`[lib] name = "freerdp_sys"\`, so the calls
           read \`freerdp_sys::freerdp_connect()\`.
 
@@ -208,9 +208,9 @@ jobs:
 
           The channel set is deliberately wider than the wrapper uses. cmake generates the addin
           table at *configure* time, so the set is frozen into the archive and a consumer cannot
-          enable one later — building them all in now means audio and dynamic resize need no new
-          release. Static linking is per-object, so a binary that never mentions \`rdpsnd\` pulls
-          none of it in.
+          enable one later — building them all in is why dynamic resize could be added to the
+          wrapper without a new archive, and why audio can be. Static linking is per-object, so a
+          binary that never mentions \`rdpsnd\` pulls none of it in.
 
           ## No toolchain, and no C++ runtime
 

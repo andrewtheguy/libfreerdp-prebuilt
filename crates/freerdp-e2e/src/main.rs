@@ -15,6 +15,10 @@
 //! look like full coverage — the connecting half runs on the Linux targets, against the same xrdp
 //! container image the consuming project already uses.
 //!
+//! The resize leg is the one part conditional on the *server* rather than on the archives:
+//! MS-RDPEDISP is optional, so a server that does not offer it is reported and skipped rather than
+//! failing a build of the libraries over the age of a container image.
+//!
 //! Exit code 0 means every check that ran passed. Anything else prints why.
 
 use freerdp::{Connect, Event, Session};
@@ -92,6 +96,9 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         password: password.into(),
         width: 1024,
         height: 768,
+        // On for the resize leg below, and this is the only place in the repository that turns it
+        // on — `Connect::resize` says why it is off by default.
+        resize: true,
         ..Connect::default()
     });
 
@@ -102,6 +109,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let mut connected = None;
     let mut painted = 0usize;
     let mut pixels = 0usize;
+    let mut resize_ready = false;
 
     while Instant::now() < deadline {
         let Ok(event) = events.recv_timeout(Duration::from_secs(5)) else { continue };
@@ -120,6 +128,10 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
                 }
             }
             Event::Cursor(cursor) => println!("cursor          {cursor:?}"),
+            Event::ResizeReady { max_monitors, max_area } => {
+                println!("displaycontrol  up to {max_monitors} monitors, {max_area} pixels");
+                resize_ready = true;
+            }
             Event::Ended(result) => {
                 panic!("the session ended before it painted: {result:?}");
             }
@@ -152,6 +164,96 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     session.input().key(0x1C, false, true);
     session.input().key(0x1C, false, false);
 
+    resize_check(&session, &events, resize_ready, width, height);
+
     session.shutdown();
     println!("disconnected    cleanly");
+}
+
+/// Ask for a different desktop size, and see whether one arrives.
+///
+/// **Conditional on the server, and deliberately so.** MS-RDPEDISP is optional, older xrdp builds
+/// do not implement it, and this program runs against whatever RDP server the pipeline could
+/// start — so a hard assertion here would turn "the container image is old" into a failed build of
+/// the archives, which is a claim about the wrong thing entirely. What *is* asserted is the part
+/// that belongs to this crate: if the server said it would listen, a resize must produce a
+/// framebuffer of the new size. A server that never offered the channel is reported and skipped,
+/// the same way the offline half reports what a macOS runner cannot do.
+fn resize_check(
+    session: &Session,
+    events: &std::sync::mpsc::Receiver<Event>,
+    ready: bool,
+    width: u32,
+    height: u32,
+) {
+    // Sent before knowing whether the channel is up, on purpose. The paint loop above stops after
+    // five rectangles, which may well be before the display-control capabilities have arrived, so
+    // reading its `ready` flag as final would skip this check on a race rather than on a fact. The
+    // wrapper holds a request made too early and sends it when the channel opens, which is exactly
+    // the behaviour worth exercising here.
+    //
+    // Smaller than the connect size, so it fits inside any desktop the server might have, and
+    // deliberately *odd* — 801 is what a real viewport produces, and the width must be even on the
+    // wire. If `sanitise_size` did not round it down, this is where a Windows host silently
+    // ignores the layout and the resize never arrives.
+    let (want_width, want_height) = (801, 600);
+    println!("resize          asking for {want_width}x{want_height}");
+    session.input().resize(want_width, want_height);
+    let asked = Instant::now();
+
+    let mut ready = ready;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        let event = match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(event) => event,
+            Err(_) => {
+                // **Asking again is not belt-and-braces, it is the protocol.** A Windows 11 host
+                // ignores a monitor layout sent while it is still bringing the session up, and
+                // says nothing about having done so — measured here: the same 800x600 layout was
+                // dropped 400 ms after the capabilities PDU and honoured 6.7 s in, on the same
+                // host in the same session. There is no observable "ready now", so the only thing
+                // a client can do is ask again, which is what an embedder driving this from a
+                // viewport must also do. See `Input::resize`.
+                if ready {
+                    println!("resize          asking again, {:?} in", asked.elapsed());
+                    session.input().resize(want_width, want_height);
+                }
+                continue;
+            }
+        };
+        match event {
+            Event::ResizeReady { max_monitors, max_area } => {
+                println!("displaycontrol  up to {max_monitors} monitors, {max_area} pixels");
+                ready = true;
+            }
+            Event::Resize { width, height } => {
+                println!("resized         {width}x{height}");
+                // The size the *server* chose, which need not be the one asked for — but the
+                // framebuffer must agree with it, because that is this crate's own invariant and
+                // the thing a reallocation under a reader would break.
+                session.framebuffer().with(|frame| {
+                    assert_eq!(
+                        (frame.width, frame.height),
+                        (width, height),
+                        "the framebuffer disagrees with the resize that was just announced"
+                    );
+                });
+                assert_ne!(
+                    (width, height),
+                    (0, 0),
+                    "a resize to nothing is not a resize"
+                );
+                return;
+            }
+            Event::Ended(result) => panic!("the session ended during the resize: {result:?}"),
+            _ => {}
+        }
+    }
+
+    assert!(
+        !ready,
+        "the server offered DisplayControl and then ignored a layout for \
+         {want_width}x{want_height} — the desktop is still {width}x{height} after 30 s"
+    );
+    println!("resize          skipped — this server does not offer DisplayControl");
 }
