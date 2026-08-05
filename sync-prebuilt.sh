@@ -23,8 +23,15 @@
 #   freerdp.env pins a tarball checksum
 #     -> source.sh refuses anything else
 #       -> build.sh compiles it and *installs* a header tree
-#         -> those headers are what is committed here
+#         -> the part of it wrapper.h reaches is what is committed here
 #           -> and bindings.rs is what bindgen makes of them
+#
+# "the part wrapper.h reaches" is 100 headers of 261, and the rest is not a smaller claim so much
+# as a more honest one. What this file is protecting is the provenance of `bindings.rs`: that the
+# headers it came from are the ones this build installed, rather than a stale set from an older
+# FreeRDP — which the tarball checksum would happily keep verifying, since it says nothing about
+# what is committed. A header bindgen never opens is 1.2 MB in every consumer's checkout and
+# evidence of nothing.
 #
 # That raises a question libvpx-prebuilt never had to answer. Those generated headers are
 # **host-dependent** — `WINPR_HAVE_SYS_EVENTFD_H` on Linux, `WINPR_HAVE_SYS_FILIO_H` on Darwin —
@@ -69,7 +76,30 @@ canonical="${SYNC_HEADERS_FROM:-linux-x86_64}"
 
 # Files whose contents legitimately differ between targets. Committed, small, and read by
 # --check; anything not on it must be byte-identical everywhere.
-drift_allow=header-drift.allow
+drift_allow="header-drift.allow"
+
+# The headers `wrapper.h` actually reaches, asked of the compiler rather than curated.
+#
+# FreeRDP installs 261 public headers and this crate's `wrapper.h` reaches 100 of them; the other
+# 161 are 1.2 MB that nothing here reads — the channels the archives carry but the wrapper does not
+# bind (`rdpsnd.h`, `rail.h`, `scard.h`, `urbdrc.h`), plus RAIL and the server-side API. Every
+# consumer paid that in their checkout for a tree only `gen-bindings.sh` opens: `build.rs` never
+# looks at `include/` at all, because the bindings are committed.
+#
+# **Derived, never listed.** The set is a property of `wrapper.h`, and `wrapper.h` grows the moment
+# a channel gets bound — binding `rdpsnd` for audio pulls a dozen of these back. A hand-maintained
+# list would be wrong the first time that happened and would fail confusingly; `cc -MM` is right by
+# construction and re-derives itself.
+#
+# Emitted relative to the include root, sorted, one per line. `-MM` rather than `-M` so system
+# headers stay out, which is the same distinction `--allowlist-file` draws in gen-bindings.sh.
+reachable_headers() {
+  local root="$1"
+  cc -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
+    | tr ' ' '\n' \
+    | sed -n "s#^$root/##p" \
+    | sort -u
+}
 
 case "${1:-}" in
   --headers)
@@ -86,16 +116,30 @@ case "${1:-}" in
       echo "!! another machine will not reproduce. Only correct while bootstrapping." >&2
     fi
 
+    # Only what `wrapper.h` reaches, and asked of the compiler against the *installed* tree —
+    # which is the authority, since that is what was built. See `reachable_headers`.
+    # `while read` rather than the obvious builtin: macOS ships bash 3.2.
+    wanted=()
+    while IFS= read -r header; do wanted+=("$header"); done \
+      < <(reachable_headers "$src/include")
+    [ "${#wanted[@]}" -gt 50 ] || {
+      echo "only ${#wanted[@]} headers reachable from wrapper.h, which cannot be right" >&2
+      echo "  A parse failure in wrapper.h reports as an empty dependency list, so this is" >&2
+      echo "  checked rather than trusted. Run the cc line by hand to see the error." >&2
+      exit 1
+    }
+
     rm -rf "$crate/include"
-    mkdir -p "$crate/include"
-    cp -R "$src/include/freerdp3" "$crate/include/freerdp3"
-    cp -R "$src/include/winpr3" "$crate/include/winpr3"
+    for header in "${wanted[@]}"; do
+      mkdir -p "$crate/include/$(dirname "$header")"
+      cp "$src/include/$header" "$crate/include/$header"
+    done
     # FreeRDP is Apache-2.0 and OpenSSL 3 is Apache-2.0; both archives ship their own copy, and
     # the repository root carries them too, where anyone looks first.
     cp "$src/LICENSE.FreeRDP" LICENSE.FreeRDP
     cp "$src/LICENSE.OpenSSL" LICENSE.OpenSSL
     echo ">> $crate/include is FreeRDP $FREERDP_VERSION's installed headers from $canonical"
-    echo "   $(find "$crate/include" -name '*.h' | wc -l | tr -d ' ') headers"
+    echo "   ${#wanted[@]} headers, of $(find "$src/include" -name '*.h' | wc -l | tr -d ' ') installed — what wrapper.h reaches"
     (cd "$crate" && ./gen-bindings.sh)
     ;;
 
@@ -116,41 +160,73 @@ case "${1:-}" in
     # the flags cmake chose for that machine. So those files are properties of whoever ran the
     # build, not of this project, on any comparison rather than only across targets.
     #
-    # The check is still worth what it claims. None of the allowlisted constants reaches
-    # `bindings.rs` (asserted below by `gen-bindings.sh --check`, which regenerates from the tree
-    # that was just built), so what is being checked is the 255 headers that describe the ABI, and
-    # those must be identical everywhere.
+    # **The comparison is over what `wrapper.h` reaches, not over the whole installed tree**, and
+    # that is a narrowing of the claim rather than a weakening of it. What this check is for is the
+    # provenance of `bindings.rs`: that the headers it was generated from are the ones this build
+    # installed, rather than a stale set from an older FreeRDP that the source pin would happily
+    # still verify. A header bindgen never opens proves nothing about that either way.
+    #
+    # Two things keep the narrowing honest. The reachable set is computed from *each target's own*
+    # installed tree, so a header that has become reachable and was never committed is a missing
+    # file here rather than a surprise at regeneration time. And a committed header that is no
+    # longer reachable is an error too, so the tree cannot silently accumulate what `wrapper.h`
+    # stopped including.
     checked=0
     for dir in dist/*/; do
       target="$(basename "$dir")"
       [ -d "$dir/include" ] || continue
       checked=$((checked + 1))
 
-      # `diff -rq` names changed, missing *and* extra files — the last one matters, because
-      # bindings.rs is generated from whatever is sitting in that directory.
-      differences="$(diff -rq "$dir/include" "$crate/include" 2>&1 || true)"
-      if [ -z "$differences" ]; then
-        echo "   $target: byte-identical to the committed headers"
-        continue
+      wanted=()
+      while IFS= read -r header; do wanted+=("$header"); done \
+        < <(reachable_headers "$dir/include")
+      [ "${#wanted[@]}" -gt 50 ] || {
+        echo "only ${#wanted[@]} headers reachable from wrapper.h against $target" >&2
+        echo "  A parse failure reports as an empty dependency list, so this is checked." >&2
+        exit 1
+      }
+
+      # Every reachable header must be committed, and identical unless it is on the allowlist.
+      missing='' differing=''
+      for header in "${wanted[@]}"; do
+        if [ ! -f "$crate/include/$header" ]; then
+          missing+="  $header"$'\n'
+        elif ! cmp -s "$dir/include/$header" "$crate/include/$header" \
+          && ! grep -qxF "$header" "$drift_allow" 2>/dev/null; then
+          differing+="  $header"$'\n'
+        fi
+      done
+
+      if [ -n "$missing" ]; then
+        echo "$target: wrapper.h reaches headers that are not committed — run --headers:" >&2
+        printf '%s' "$missing" >&2
+        exit 1
       fi
-
-      # Reduced to bare paths relative to the include root, then checked against the allowlist.
-      unexpected=''
-      while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        path="$(sed -E "s#^Files $dir/include/(.*) and .*#\1#; s#^Only in [^:]*: #?? #" <<<"$line")"
-        grep -qxF "$path" "$drift_allow" 2>/dev/null || unexpected+="$line"$'\n'
-      done <<<"$differences"
-
-      if [ -n "$unexpected" ]; then
+      if [ -n "$differing" ]; then
         echo "$target's headers differ from the committed ones outside $drift_allow:" >&2
-        head -30 <<<"$unexpected" >&2
+        printf '%s' "$differing" >&2
         echo "  Either the difference is legitimate — a generated config header — and belongs" >&2
         echo "  on the allowlist, or something in build.sh is not configuring every target the" >&2
         echo "  same, or the committed headers are stale and need --headers." >&2
         exit 1
       fi
-      echo "   $target: differs only in the $(wc -l < "$drift_allow" | tr -d ' ') allowlisted generated headers"
+
+      # And nothing committed that nothing reads. Only against the canonical target, because a
+      # header reachable on Linux and not on Darwin is a real thing (`#ifdef __linux__` in
+      # wrapper.h's transitive includes) and would make this fire on the wrong platform.
+      if [ "$target" = "$canonical" ]; then
+        extra=()
+        while IFS= read -r header; do extra+=("$header"); done < <(comm -13 \
+          <(printf '%s\n' "${wanted[@]}") \
+          <(cd "$crate/include" && find . -name '*.h' | sed 's#^\./##' | sort))
+        if [ "${#extra[@]}" -gt 0 ]; then
+          echo "committed headers that wrapper.h no longer reaches — run --headers:" >&2
+          printf '  %s\n' "${extra[@]}" >&2
+          exit 1
+        fi
+      fi
+
+      echo "   $target: ${#wanted[@]} headers reachable from wrapper.h, all committed and current"
     done
 
     if [ "$checked" -eq 0 ]; then

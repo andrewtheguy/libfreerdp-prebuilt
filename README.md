@@ -58,7 +58,8 @@ freerdp.env pins two tarball checksums
 Separately, and this is the part a reviewer can read:
 
 ```
-include/         is byte-identical to what linux-x86_64's `cmake --install` produced
+include/         is what linux-x86_64's `cmake --install` produced, for the 100 headers
+                 of its 261 that `wrapper.h` reaches — asked of the compiler, not curated
 src/bindings_apple.rs   is what bindgen 0.72.1 makes of those headers on Apple
 src/bindings_linux.rs   … and on Linux                    (both checked, each on its own platform)
 ```
