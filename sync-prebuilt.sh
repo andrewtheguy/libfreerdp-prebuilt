@@ -31,8 +31,12 @@
 # so the installed set is *not* byte-identical across targets, and a plain `diff -r` between
 # targets cannot be the check. Two answers, both measurements rather than arguments:
 #
-#   - one target is canonical (below), and `--check` diffs every *other* built target against it
-#     with a small committed allowlist of files permitted to differ (header-drift.allow);
+#   - one target is canonical (below) and supplies the committed set; `--check` diffs every built
+#     target against it with a small committed allowlist of files permitted to differ
+#     (header-drift.allow). That allowlist applies to the canonical target too, because the files
+#     on it are properties of the *machine* — `FREERDP_INSTALL_PREFIX` is the absolute build path,
+#     `FREERDP_COMPILER_VERSION` is whatever ran — so even the same target on another runner
+#     differs in them;
 #   - CI runs `gen-bindings.sh --check` on all three targets against each target's own headers
 #     and requires all three to produce an identical bindings.rs. That converts "one bindings.rs
 #     is portable" from an assumption into a per-release measurement.
@@ -101,8 +105,21 @@ case "${1:-}" in
       exit 1
     }
 
-    # Against every target sitting in dist/. The canonical one must match exactly; the others may
-    # differ only in the files the allowlist names.
+    # Against every target sitting in dist/, and every one of them may differ only in the files
+    # the allowlist names — **including the canonical target**.
+    #
+    # That last part was a correction. The canonical target used to have to match byte for byte,
+    # on the reasoning that the committed headers came from it; CI then failed because the headers
+    # committed from a `debian:trixie` container are not the ones an `ubuntu-24.04` runner
+    # produces, and never can be. `build-config.h` bakes in `FREERDP_INSTALL_PREFIX` — the
+    # *absolute path of the build directory* — and `buildflags.h` records the compiler version and
+    # the flags cmake chose for that machine. So those files are properties of whoever ran the
+    # build, not of this project, on any comparison rather than only across targets.
+    #
+    # The check is still worth what it claims. None of the allowlisted constants reaches
+    # `bindings.rs` (asserted below by `gen-bindings.sh --check`, which regenerates from the tree
+    # that was just built), so what is being checked is the 255 headers that describe the ABI, and
+    # those must be identical everywhere.
     checked=0
     for dir in dist/*/; do
       target="$(basename "$dir")"
@@ -117,12 +134,6 @@ case "${1:-}" in
         continue
       fi
 
-      if [ "$target" = "$canonical" ]; then
-        echo "the committed headers are not what $canonical installs — run --headers" >&2
-        head -30 <<<"$differences" >&2
-        exit 1
-      fi
-
       # Reduced to bare paths relative to the include root, then checked against the allowlist.
       unexpected=''
       while IFS= read -r line; do
@@ -132,10 +143,11 @@ case "${1:-}" in
       done <<<"$differences"
 
       if [ -n "$unexpected" ]; then
-        echo "$target's headers differ from $canonical's outside $drift_allow:" >&2
+        echo "$target's headers differ from the committed ones outside $drift_allow:" >&2
         head -30 <<<"$unexpected" >&2
         echo "  Either the difference is legitimate — a generated config header — and belongs" >&2
-        echo "  on the allowlist, or something in build.sh is not configuring both the same." >&2
+        echo "  on the allowlist, or something in build.sh is not configuring every target the" >&2
+        echo "  same, or the committed headers are stale and need --headers." >&2
         exit 1
       fi
       echo "   $target: differs only in the $(wc -l < "$drift_allow" | tr -d ' ') allowlisted generated headers"
