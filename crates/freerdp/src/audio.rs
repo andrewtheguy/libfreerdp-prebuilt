@@ -355,7 +355,28 @@ unsafe extern "C" fn play(
         // SAFETY: as `format_supported`.
         let Some((bridge, audio)) = (unsafe { audio(device) }) else { return 0 };
         if bridge.audio_device != device {
-            return 0;
+            // A device that lost the claim to another stays silent — but a *vacant* claim is
+            // adopted, because the device rdpsnd plays after reloading the channel is one it
+            // will never call `Open` on. `rdpsnd_on_close` frees the old device and nulls
+            // `rdpsnd->device`, but never resets the plugin's `isOpen` or `wCurrentFormatNo`;
+            // when the channel comes back — a resize's Deactivation-Reactivation Sequence is
+            // the trigger that surfaced this, with the server reopening the audio channel on
+            // the other side of it — the first wave finds `isOpen` still true and the format
+            // number unchanged (with exactly one advertised format it is always 0), so
+            // `rdpsnd_ensure_device_is_open` skips `Open` entirely and calls `Play` on a
+            // device that owns nothing. Refusing that wave was a session whose sound never
+            // came back after a resize.
+            //
+            // Adopting is sound because the format is not in doubt: a wave's format number
+            // indexes the client format list this same device built through `FormatSupported`,
+            // which accepts nothing but `audio.format`. And it cannot race a legitimate owner:
+            // only `open` and this line claim, both on the FreeRDP thread, and both only when
+            // the claim is empty.
+            if !bridge.audio_device.is_null() {
+                return 0;
+            }
+            bridge.audio_device = device;
+            audio.sink.opened(audio.format);
         }
         // SAFETY: rdpsnd owns this buffer for the duration of the call and `size` is its length.
         audio.sink.wave(unsafe { std::slice::from_raw_parts(data, size) });
