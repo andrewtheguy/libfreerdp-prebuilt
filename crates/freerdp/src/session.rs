@@ -1172,7 +1172,26 @@ unsafe fn send_refresh(ctx: *mut sys::rdpContext) {
 unsafe fn resize(ctx: *mut sys::rdpContext, width: u32, height: u32, scale_percent: u32) {
     // SAFETY: the caller guarantees the context.
     let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
+    // A request for the desktop already on screen does nothing, on either strategy. This is
+    // the rule a Windows host applies to monitor layouts on its own — and the reconnect
+    // strategy has to apply it for itself, because layouts are never acknowledged and an
+    // embedder therefore re-asks on a schedule: the retry that raced the first reconnect
+    // would otherwise land after it, equal to the new desktop, and buy a second reconnect
+    // for nothing. The scale is part of the comparison — `reconnect_resize` writes it back
+    // to settings, so a genuine density change always differs here.
     // SAFETY: settings are live on a live context.
+    let same = unsafe {
+        use sys::FreeRDP_Settings_Keys_UInt32 as U;
+        let settings = (*ctx).settings;
+        width == sys::freerdp_settings_get_uint32(settings, U::FreeRDP_DesktopWidth)
+            && height == sys::freerdp_settings_get_uint32(settings, U::FreeRDP_DesktopHeight)
+            && scale_percent
+                == sys::freerdp_settings_get_uint32(settings, U::FreeRDP_DesktopScaleFactor)
+    };
+    if same {
+        return;
+    }
+    // SAFETY: as above.
     let egfx = unsafe {
         sys::freerdp_settings_get_bool(
             (*ctx).settings,
