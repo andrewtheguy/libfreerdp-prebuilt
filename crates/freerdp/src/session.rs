@@ -147,6 +147,13 @@ pub enum Event {
     Connected { width: u32, height: u32 },
     /// This rectangle of the framebuffer changed.
     Paint(Rect),
+    /// The server finished a frame: every [`Event::Paint`] since the last `Frame` belongs to one
+    /// coherent picture, and this is the moment to present it. Sent only when the server says so
+    /// itself — a legacy-path frame marker order, a surface frame marker, or the graphics
+    /// pipeline's per-frame flush — never guessed from timing. A server that marks no frames
+    /// sends none of these, so a consumer keeps whatever pacing it had and treats this as the
+    /// upgrade it is.
+    Frame,
     /// The server changed the desktop size. The framebuffer has already been resized and
     /// cleared, so everything is about to be repainted.
     ///
@@ -785,6 +792,14 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // supported, and what every real client asks for.
         (B::FreeRDP_FastPathInput, true),
         (B::FreeRDP_FastPathOutput, true),
+        // Ask the server to say where its frames end. Both are capability bits a server is free
+        // to ignore; where honoured, a TS_FRAME_MARKER order or a surface frame marker brackets
+        // each frame and the END goes out as [`Event::Frame`]. A consumer coalescing damage on a
+        // timer is reconstructing exactly this boundary, so where the fact is on offer it should
+        // not have to guess. (EGFX sessions carry their own frame PDUs and use neither — their
+        // boundary comes out of `end_paint`.)
+        (B::FreeRDP_FrameMarkerCommandEnabled, true),
+        (B::FreeRDP_SurfaceFrameMarkerEnabled, true),
         // **Full window drag stays on**, which is what a LAN declaration means. Turned
         // off, Windows draws a rubber-band outline instead of the window while it is
         // being dragged — and on a remote desktop that does not read as a bandwidth
@@ -1183,6 +1198,11 @@ unsafe extern "C" fn post_connect(instance: *mut sys::freerdp) -> sys::BOOL {
             (*update).BeginPaint = Some(begin_paint);
             (*update).EndPaint = Some(end_paint);
             (*update).DesktopResize = Some(desktop_resize);
+            // The frame boundaries `apply_settings` asked for, surfaced as `Event::Frame`.
+            // `SurfaceFrameAcknowledge` is deliberately left alone: it is core's *sender*
+            // (`update_send_frame_acknowledge`), which `surface_frame_marker` calls.
+            (*update).SurfaceFrameMarker = Some(surface_frame_marker);
+            (*(*update).altsec).FrameMarker = Some(frame_marker);
             ((*gdi).width.max(0) as u32, (*gdi).height.max(0) as u32)
         };
 
@@ -1312,7 +1332,62 @@ unsafe extern "C" fn end_paint(ctx: *mut sys::rdpContext) -> sys::BOOL {
                 rect,
             );
             bridge.send(Event::Paint(rect));
+            // On EGFX this paint *is* a frame. The pipeline flushes its surfaces to the GDI
+            // once per frame PDU — `gdi_EndFrame` calls `gdi_OutputUpdate`, which brackets the
+            // frame's whole invalid region in one Begin/EndPaint — and it does so before
+            // clearing `inGfxFrame`, so the flag here means "that flush and nothing else".
+            // The legacy frame markers never arrive on a session whose graphics ride the
+            // pipeline, which is why this is the pipeline's boundary and not a duplicate.
+            if (*gdi).inGfxFrame != 0 {
+                bridge.send(Event::Frame);
+            }
         }
+        1
+    })
+}
+
+/// TS_FRAME_MARKER, the legacy path's frame boundary. Only the END matters: the START clears
+/// nothing and promises nothing, and guacamole-server ignores it the same way.
+unsafe extern "C" fn frame_marker(
+    ctx: *mut sys::rdpContext,
+    marker: *const sys::FRAME_MARKER_ORDER,
+) -> sys::BOOL {
+    guarded("FrameMarker", 0, || {
+        let Some(bridge) = (unsafe { bridge(ctx) }) else { return 0 };
+        // SAFETY: FreeRDP passes a marker it just parsed, on a live context.
+        if unsafe { (*marker).action } == sys::FRAME_END {
+            bridge.send(Event::Frame);
+        }
+        1
+    })
+}
+
+/// The surface-command flavour of the same boundary — and the one that owes the server an
+/// answer. `FrameAcknowledge` (FreeRDP's default is 2) is the client's advertised in-flight
+/// window; a server that negotiated it stops sending after that many unacknowledged frames,
+/// so the acknowledgment is what keeps the stream moving, not a courtesy.
+unsafe extern "C" fn surface_frame_marker(
+    ctx: *mut sys::rdpContext,
+    marker: *const sys::SURFACE_FRAME_MARKER,
+) -> sys::BOOL {
+    guarded("SurfaceFrameMarker", 0, || {
+        let Some(bridge) = (unsafe { bridge(ctx) }) else { return 0 };
+        // SAFETY: as `frame_marker`; `update` and `settings` are live on a connected context.
+        unsafe {
+            if (*marker).frameAction != sys::SURFCMD_FRAMEACTION_SURFACECMD_FRAMEACTION_END {
+                return 1;
+            }
+            if sys::freerdp_settings_get_uint32(
+                (*ctx).settings,
+                sys::FreeRDP_Settings_Keys_UInt32::FreeRDP_FrameAcknowledge,
+            ) > 0
+            {
+                if let Some(ack) = (*(*ctx).update).SurfaceFrameAcknowledge {
+                    ack(ctx, (*marker).frameId);
+                }
+            }
+        }
+        bridge.send(Event::Frame);
         1
     })
 }

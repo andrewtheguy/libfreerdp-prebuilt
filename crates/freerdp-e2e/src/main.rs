@@ -168,6 +168,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let mut connected = None;
     let mut painted = 0usize;
     let mut pixels = 0usize;
+    let mut frames = 0usize;
     let mut resize_ready = false;
     let mut clipboard_ready = false;
 
@@ -194,6 +195,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
                     break;
                 }
             }
+            Event::Frame => frames += 1,
             Event::Cursor(cursor) => println!("cursor          {cursor:?}"),
             Event::ResizeReady { max_monitors, max_area } => {
                 println!("displaycontrol  up to {max_monitors} monitors, {max_area} pixels");
@@ -224,6 +226,13 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let (width, height) = connected.expect("the session never reported a desktop size");
     assert!(painted > 0, "connected to {host} but nothing ever painted");
     println!("painted         {painted} rectangles, {pixels} pixels");
+    // Reported rather than asserted, because marking frames is the *server's* property: a
+    // server that ignores both marker capabilities is legitimate, and a consumer falls back
+    // to its own pacing. What this line settles is which kind of server the run was against.
+    match frames {
+        0 => println!("frames          this server marked no frame boundaries"),
+        n => println!("frames          {n} boundaries marked by the server"),
+    }
     // Not an assertion: a server may not offer the clipboard at all, and this
     // program runs against whatever the pipeline could start. Reported so that a
     // silent absence is visible rather than looking like coverage.
