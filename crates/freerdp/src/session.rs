@@ -744,14 +744,24 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // callbacks when `gdi_graphics_pipeline_init` reads it, which is a headless server-side
         // recorder's setting, not a client's.
         (B::FreeRDP_DeactivateClientDecoding, false),
-        // **The graphics pipeline is not advertised, and this is a measurement rather than a
-        // preference.** Against a Windows 11 host with EGFX advertised, FreeRDP decoded 21
-        // surface commands with no errors and produced exactly one `EndPaint` over a
-        // framebuffer that summed to pure black; with `SupportGraphicsPipeline = FALSE` the same
-        // host, the same build and the same second painted a real desktop. Until that is
-        // understood, the legacy bitmap path is the one that works — and it is also what every
-        // pure-Rust RDP client in production uses today, so this is not a step backwards.
-        (B::FreeRDP_SupportGraphicsPipeline, false),
+        // **The graphics pipeline is advertised, and RemoteFX beside it is what makes it
+        // work.** The pipeline alone was measured broken: against a Windows 11 host, FreeRDP
+        // decoded 21 surface commands with no errors and produced exactly one `EndPaint` over a
+        // framebuffer that summed to pure black. The missing piece was a codec next to the
+        // pipeline flag — guacamole-server ships exactly `SupportGraphicsPipeline` +
+        // `RemoteFxCodec` against the same Windows generation — and with both advertised the
+        // same e2e that measured black measures 3,090,403 non-zero bytes of 3,145,728, resizes,
+        // and disconnects cleanly. Keep the two together: the pipeline without a codec beside
+        // it is the black screen again.
+        //
+        // The pipeline is not only a better wire format. A size change over EGFX is a graphics
+        // reset rather than a full Deactivation-Reactivation Sequence, and the reactivation is
+        // what a Windows host's audio redirector does not survive — measured: on the legacy
+        // path, the last wave arrives within a second of a resize's reactivation and the
+        // channel then stays open, mute, with no close and no re-announce for as long as
+        // anyone watched.
+        (B::FreeRDP_SupportGraphicsPipeline, true),
+        (B::FreeRDP_RemoteFxCodec, true),
         // Dynamic resize. This one key is also what *loads* the channel: the addin table in
         // `client/common/cmdline.c` maps `FreeRDP_SupportDisplayControl` to `disp`, and
         // `freerdp_client_load_channels` — installed as `LoadChannels` by
@@ -810,7 +820,10 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
 /// Both ways round, because which transport carries MS-RDPEA is the *server's* choice: a modern
 /// Windows host opens `AUDIO_PLAYBACK_DVC` over drdynvc, an older one or a proxy uses the static
 /// `rdpsnd` channel, and a client that registered only one of them would simply get no sound from
-/// the other kind of server. FreeRDP's own `freerdp_client_load_addins` registers both for the
+/// the other kind of server. **Withholding the dynamic offer was tried and does not make Windows
+/// fall back**: against a Windows 11 host with only the static channel registered, no audio was
+/// negotiated at all — the server's dynamic create was refused and it never tried the static
+/// channel it had also joined. FreeRDP's own `freerdp_client_load_addins` registers both for the
 /// same reason; what it cannot do is name a subsystem, and both `freerdp_client_add_*_channel`
 /// calls are no-ops when the name is already present, so registering here first is what puts the
 /// argument in place rather than fighting with it.
@@ -1323,7 +1336,26 @@ unsafe extern "C" fn desktop_resize(ctx: *mut sys::rdpContext) -> sys::BOOL {
                 ),
             )
         };
-        // FreeRDP's buffer first, then ours, then the event. In that order: a `Resize` the caller
+        // The decoder contexts first, because FreeRDP forgets them: `rdp_client_reset_codecs`
+        // sizes them to the desktop exactly once, at connect, and `gdi_resize` below touches
+        // only the framebuffer. The planar decoder refuses any bitmap wider or taller than the
+        // size it was prepared with, so after a resize to a *larger* desktop the first
+        // full-width strip a server sends fails to decompress and `update_recv` ends the
+        // session — measured against xorgxrdp, which sends exactly such strips, as a session
+        // that survived every shrink and died on the first grow. The graphics pipeline resets
+        // codecs on its own resize path (`gdi/gfx.c`), which is why clients running EGFX never
+        // see this; the legacy bitmap path just forgot.
+        //
+        // SAFETY: context, settings and codecs are live on a connected context; the flags
+        // getter reads the same settings this callback already reads.
+        unsafe {
+            let flags = sys::freerdp_settings_get_codecs_flags((*ctx).settings);
+            if sys::freerdp_client_codecs_reset((*ctx).codecs, flags, width, height) == 0 {
+                eprintln!("freerdp: codecs_reset to {width}x{height} failed");
+                return 0;
+            }
+        }
+        // FreeRDP's buffer next, then ours, then the event. In that order: a `Resize` the caller
         // acts on before the framebuffer has grown would read a stale size.
         // SAFETY: `gdi` is live on a connected context.
         if unsafe { sys::gdi_resize((*ctx).gdi, width, height) } == 0 {
@@ -1994,6 +2026,10 @@ mod tests {
     /// format and throws every buffer away. A session that lost this argument would negotiate
     /// audio, report no error, log "Loaded fake backend for rdpsnd" at a level nobody reads, and
     /// play nothing.
+    ///
+    /// Both transports, and the *both* was re-measured: withholding the dynamic offer to force
+    /// Windows onto the reactivation-surviving static channel produced no audio at all — the
+    /// server never fell back.
     #[test]
     fn the_audio_channel_names_this_crates_subsystem() {
         // SAFETY: a standalone settings object, used and freed here; nothing else refers to it.

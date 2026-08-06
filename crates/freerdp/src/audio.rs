@@ -301,6 +301,15 @@ unsafe extern "C" fn server_format_announce(
 }
 
 /// The channel settled on a format and is about to send buffers.
+///
+/// **This must not fail**, and that is a fact about rdpsnd rather than a preference: a FALSE
+/// from `Open` makes `rdpsnd_ensure_device_is_open` return FALSE, the wave handler answer
+/// `ERROR_INTERNAL_ERROR`, and the plugin's play thread — both transports run one by default —
+/// `return error` and exit. That is not one dropped wave, it is every wave for the rest of the
+/// session, and on a synchronous channel it is `setChannelError` and the session itself. So both
+/// refusals this device used to make are now answered with success and expressed through the
+/// claim instead: what `play` delivers is decided by who holds it, and a device that does not is
+/// accepted, silent, and harmless.
 unsafe extern "C" fn open(
     device: *mut sys::rdpsndDevicePlugin,
     format: *const sys::AUDIO_FORMAT,
@@ -314,24 +323,36 @@ unsafe extern "C" fn open(
         let Some((bridge, audio)) = (unsafe { audio(device) }) else { return 0 };
         // Checked again, and not defensively. `rdpsnd_ensure_device_is_open` opens a device with
         // a format of its own invention when `FormatSupported` said no — PCM at the *server's*
-        // rate, to be transcoded on the way in — and accepting that would hand the sink 48 kHz
-        // where it asked for 44.1 and said nothing. Refusing is the honest failure: the wave is
-        // dropped, `opened` is never called, and the caller sees no negotiated format.
+        // rate, to be transcoded on the way in — and accepting that into the claim would hand
+        // the sink 48 kHz where it asked for 44.1 and said nothing. The device opens anyway (see
+        // above for what a refusal costs); it just cannot hold the claim, so its waves go
+        // nowhere, which is the silence the old refusal intended without the play thread's
+        // corpse. Releasing a claim this device holds matters on a reopen: rdpsnd closes and
+        // reopens across a format change, and a claim kept through a mismatched reopen would
+        // deliver the wrong rate as if it were the right one.
         //
         // SAFETY: as above.
         if !audio.format.matches(unsafe { &*format }) {
-            return 0;
+            if bridge.audio_device == device {
+                bridge.audio_device = std::ptr::null_mut();
+                audio.sink.closed();
+            }
+            return 1;
         }
-        // One device at a time. rdpsnd is registered as both a static channel and a dynamic one,
-        // because which of the two a server drives is the server's choice, and each loads a
-        // device of its own. Nothing in MS-RDPEA says a server may drive both at once and none
-        // does — but if one ever did, both would push buffers into the same sink and the result
-        // would be interleaved noise with nothing anywhere to explain it. First open wins.
-        if !bridge.audio_device.is_null() && bridge.audio_device != device {
-            return 0;
+        // One device at a time, and the *last* to open holds the claim. rdpsnd is registered as
+        // both a static channel and a dynamic one, because which of the two a server drives is
+        // the server's choice, and each loads a device of its own. Nothing in MS-RDPEA says a
+        // server may drive both at once and none does — but a resize's
+        // Deactivation-Reactivation Sequence makes servers close and reload one mid-session,
+        // and the reloaded channel's device must be able to win the claim back from whichever
+        // device held it before, or the session is one that never plays again. An `Open` is a
+        // server actively driving that transport, which is the best liveness signal there is;
+        // the loser it displaces is by that same evidence idle, so one sink still only ever has
+        // one live producer.
+        if bridge.audio_device != device {
+            bridge.audio_device = device;
+            audio.sink.opened(audio.format);
         }
-        bridge.audio_device = device;
-        audio.sink.opened(audio.format);
         1
     })
 }
