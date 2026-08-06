@@ -221,6 +221,13 @@ unsafe extern "C" fn addin_provider(
 #[repr(C)]
 struct Device {
     plugin: sys::rdpsndDevicePlugin,
+    /// Whether this device was minted for the dynamic transport, decided at creation by order:
+    /// the static channel loads its device during connect's channel bring-up, strictly before
+    /// the event loop can process the DVC create a dynamic one rides in on, so the first device
+    /// of a connect is the static channel's and every later one is `AUDIO_PLAYBACK_DVC`'s.
+    /// `server_format_announce` reads it to mark the session — see
+    /// `Bridge::audio_dynamic_negotiated` for what that mark decides.
+    dynamic: bool,
 }
 
 /// Recover the session's bridge and audio configuration from a device pointer.
@@ -287,7 +294,7 @@ unsafe extern "C" fn server_format_announce(
 ) -> sys::UINT {
     guarded("rdpsnd ServerFormatAnnounce", sys::CHANNEL_RC_OK, || {
         // SAFETY: as `format_supported`.
-        let Some((_, audio)) = (unsafe { audio(device) }) else { return sys::CHANNEL_RC_OK };
+        let Some((bridge, audio)) = (unsafe { audio(device) }) else { return sys::CHANNEL_RC_OK };
         let offered: &[sys::AUDIO_FORMAT] = if formats.is_null() || count == 0 {
             &[]
         } else {
@@ -295,7 +302,17 @@ unsafe extern "C" fn server_format_announce(
             // length.
             unsafe { std::slice::from_raw_parts(formats, count) }
         };
-        audio.sink.negotiated(offered.iter().filter(|f| audio.format.matches(f)).count());
+        let accepted = offered.iter().filter(|f| audio.format.matches(f)).count();
+        // Sound negotiating on the dynamic transport is the mark of the one server whose
+        // redirector does not survive a legacy resize's reactivation, and it changes how this
+        // session resizes — see `session::resize`. Only a negotiation that accepted something
+        // counts: a server offering nothing this device takes will stream nothing, and there is
+        // no stream for a reactivation to kill.
+        // SAFETY: `device` is one this crate registered, so it is really a `Device`.
+        if accepted > 0 && unsafe { (*(device as *mut Device)).dynamic } {
+            bridge.audio_dynamic_negotiated = true;
+        }
+        audio.sink.negotiated(accepted);
         sys::CHANNEL_RC_OK
     })
 }
@@ -477,11 +494,28 @@ unsafe extern "C" fn subsystem_entry(
         if entry_points.is_null() {
             return sys::CHANNEL_RC_INITIALIZATION_ERROR;
         }
+        // Count the device in before anything can fail, so the ordinal stays honest: the
+        // transport a device serves is decided by creation order — see the field.
+        //
+        // SAFETY: `entry_points` is live for this call, and the plugin's context is the one
+        // this crate created, since rdpsnd was loaded onto it.
+        let dynamic = unsafe {
+            let ctx = sys::freerdp_rdpsnd_get_context((*entry_points).rdpsnd);
+            match bridge(ctx) {
+                Some(bridge) => {
+                    let ordinal = bridge.audio_devices_seen;
+                    bridge.audio_devices_seen += 1;
+                    ordinal > 0
+                }
+                None => false,
+            }
+        };
         let mut device = Box::new(Device {
             // SAFETY: `rdpsndDevicePlugin` is all pointers and function pointers, for which the
             // all-zero pattern is a valid null. rdpsnd reads every one through `IFCALL`, which
             // checks for null first.
             plugin: unsafe { std::mem::zeroed() },
+            dynamic,
         });
         device.plugin.FormatSupported = Some(format_supported);
         device.plugin.ServerFormatAnnounce = Some(server_format_announce);

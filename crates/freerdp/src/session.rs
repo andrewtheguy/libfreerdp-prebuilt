@@ -27,7 +27,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ------------------------------------------------------------------ configuration
 
@@ -112,6 +112,13 @@ pub struct Connect {
     ///
     /// FreeRDP handles the reactivation itself, inside `freerdp_check_event_handles` — this crate
     /// sees only a [`Event::Resize`] afterwards.
+    ///
+    /// Turning this on also declines the graphics pipeline, and one kind of session then resizes
+    /// by *reconnecting* rather than by a monitor layout: a server whose sound arrived over the
+    /// dynamic `rdpsnd` transport, which is a Windows host, whose audio redirector does not
+    /// survive the legacy path's reactivation. The reconnect renegotiates the channels and the
+    /// sound with them, and still surfaces as the one [`Event::Resize`]. See `resize` in this
+    /// module for the measurements.
     pub resize: bool,
     pub connect_timeout: Duration,
     pub keepalive: KeepAlive,
@@ -465,7 +472,39 @@ pub(crate) struct Bridge {
     /// The most recent size asked for before the channel was ready — only the most recent, since
     /// a resize supersedes every earlier one rather than queueing behind it.
     pending_resize: Option<(u32, u32, u32)>,
+    /// How many `rdpsnd` devices the current connect has minted. The channel is registered on
+    /// both transports and each loads a device of its own, in a fixed order: the static
+    /// instance's arrives during `freerdp_connect`'s channel bring-up, strictly before the event
+    /// loop can process the DVC create a dynamic one rides in on. So the first device of a
+    /// connect belongs to the static channel and every later one to `AUDIO_PLAYBACK_DVC` —
+    /// which is the whole reason to count. Reset by `reconnect_resize`, whose reconnect runs
+    /// the bring-up again.
+    pub(crate) audio_devices_seen: u32,
+    /// Whether redirected sound has negotiated over the dynamic transport this session. This is
+    /// the mark of a server whose audio does not survive a Deactivation-Reactivation — see
+    /// `resize` — and it is never unset: the transport is the server's choice, and a server
+    /// that chose it once chooses it on every reconnect.
+    pub(crate) audio_dynamic_negotiated: bool,
+    /// A resize the event loop should perform as a reconnect, and when it was last superseded.
+    pending_reconnect: Option<PendingReconnect>,
 }
+
+/// A resize waiting out `RECONNECT_DEBOUNCE` before it costs a reconnect.
+struct PendingReconnect {
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+    since: Instant,
+}
+
+/// How long a reconnect-resize waits for a newer size before it runs.
+///
+/// A monitor layout is cheap enough to send on every viewport report; a reconnect is not, and a
+/// window drag reports continuously. Superseding within this window collapses a drag into one
+/// reconnect after the hand pauses, at the price of every resize landing this much later. The
+/// number is xfreerdp's own resize debounce (`RESIZE_MIN_DELAY_NS` in `xf_disp.c` is 200 ms),
+/// rounded up for a strategy whose mistake costs a full reconnect rather than a layout.
+const RECONNECT_DEBOUNCE: Duration = Duration::from_millis(300);
 
 impl Bridge {
     fn send(&self, event: Event) -> bool {
@@ -542,6 +581,9 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         disp: std::ptr::null_mut(),
         resize_ready: false,
         pending_resize: None,
+        audio_devices_seen: 0,
+        audio_dynamic_negotiated: false,
+        pending_reconnect: None,
     }));
     // SAFETY: `ctx` is the context just created, so it is a `WrapperContext` with room for this.
     unsafe { (*(ctx as *mut WrapperContext)).bridge = bridge };
@@ -751,8 +793,9 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // callbacks when `gdi_graphics_pipeline_init` reads it, which is a headless server-side
         // recorder's setting, not a client's.
         (B::FreeRDP_DeactivateClientDecoding, false),
-        // **The graphics pipeline is advertised, and RemoteFX beside it is what makes it
-        // work.** The pipeline alone was measured broken: against a Windows 11 host, FreeRDP
+        // **The graphics pipeline is advertised only for a fixed-size session, and RemoteFX
+        // rides beside it either way it goes.** Two measurements own this pair, one per
+        // direction. The pipeline alone was measured broken: against a Windows 11 host, FreeRDP
         // decoded 21 surface commands with no errors and produced exactly one `EndPaint` over a
         // framebuffer that summed to pure black. The missing piece was a codec next to the
         // pipeline flag — guacamole-server ships exactly `SupportGraphicsPipeline` +
@@ -761,14 +804,17 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // and disconnects cleanly. Keep the two together: the pipeline without a codec beside
         // it is the black screen again.
         //
-        // The pipeline is not only a better wire format. A size change over EGFX is a graphics
-        // reset rather than a full Deactivation-Reactivation Sequence, and the reactivation is
-        // what a Windows host's audio redirector does not survive — measured: on the legacy
-        // path, the last wave arrives within a second of a resize's reactivation and the
-        // channel then stays open, mute, with no close and no re-announce for as long as
-        // anyone watched.
-        (B::FreeRDP_SupportGraphicsPipeline, true),
-        (B::FreeRDP_RemoteFxCodec, true),
+        // A *resizable* session declines the pipeline, because of what each path does to the
+        // desktop after a size change. Over EGFX a resize is a graphics reset, and a Windows
+        // host answers it with text that stays blurry for the rest of the session — observed
+        // repeatedly by the person using it, and the reason this gate exists. On the legacy
+        // path the same request costs a full Deactivation-Reactivation Sequence, after which
+        // the server renders the new desktop from scratch, sharp. The reactivation is the
+        // event a Windows host's audio redirector does not survive — which is what had kept
+        // the pipeline on for every session. A session in that position resizes by
+        // reconnecting instead; `resize` below tells that story.
+        (B::FreeRDP_SupportGraphicsPipeline, !config.resize),
+        (B::FreeRDP_RemoteFxCodec, !config.resize),
         // Dynamic resize. This one key is also what *loads* the channel: the addin table in
         // `client/common/cmdline.c` maps `FreeRDP_SupportDisplayControl` to `disp`, and
         // `freerdp_client_load_channels` — installed as `LoadChannels` by
@@ -931,9 +977,19 @@ fn event_loop(ctx: *mut sys::rdpContext) -> Result<(), Error> {
             };
         }
 
+        // A pending reconnect-resize turns the infinite wait into its debounce remainder, so
+        // the loop wakes to perform it even if the wire and the caller both go quiet.
+        // SAFETY: `ctx` is live; the borrow ends before any call back into FreeRDP.
+        let timeout = match unsafe { bridge(ctx) }.and_then(|b| b.pending_reconnect.as_ref()) {
+            Some(pending) => {
+                let left = RECONNECT_DEBOUNCE.saturating_sub(pending.since.elapsed());
+                (left.as_millis() as u32).max(1)
+            }
+            None => sys::INFINITE,
+        };
         // SAFETY: `handles` holds `count + 1` valid handles, which is what is passed.
         let status = unsafe {
-            sys::WaitForMultipleObjects(count + 1, handles.as_ptr(), 0, sys::INFINITE)
+            sys::WaitForMultipleObjects(count + 1, handles.as_ptr(), 0, timeout)
         };
         if status == sys::WAIT_FAILED {
             return Err(Error::local("WaitForMultipleObjects failed"));
@@ -951,6 +1007,29 @@ fn event_loop(ctx: *mut sys::rdpContext) -> Result<(), Error> {
             // SAFETY: `ctx` is live and this is the FreeRDP thread, which is the only thread
             // permitted to call into the instance.
             unsafe { execute(ctx, command) };
+        }
+
+        // A reconnect-resize runs between iterations, on fresh state, once its debounce has
+        // passed with no newer size superseding it. `execute` cannot run it in place: tearing
+        // the connection down mid-drain would leave the rest of this iteration checking
+        // handles that no longer exist.
+        // SAFETY: `ctx` is live and this is the FreeRDP thread.
+        let due = unsafe { bridge(ctx) }.and_then(|bridge| {
+            let ready = bridge
+                .pending_reconnect
+                .as_ref()
+                .is_some_and(|pending| pending.since.elapsed() >= RECONNECT_DEBOUNCE);
+            if ready { bridge.pending_reconnect.take() } else { None }
+        });
+        if let Some(pending) = due {
+            // SAFETY: as above.
+            if !unsafe {
+                reconnect_resize(ctx, pending.width, pending.height, pending.scale_percent)
+            } {
+                // The connection is already down; there is nothing to resume.
+                return Err(Error::local("a resize-by-reconnect failed"));
+            }
+            continue;
         }
 
         // SAFETY: `ctx` is live. This is where every callback in this file is called from.
@@ -1019,7 +1098,7 @@ unsafe fn execute(ctx: *mut sys::rdpContext, command: Command) {
         }
         Command::Resize { width, height, scale_percent } => {
             // SAFETY: as above.
-            unsafe { request_resize(ctx, width, height, scale_percent) };
+            unsafe { resize(ctx, width, height, scale_percent) };
         }
         Command::ClipboardAdvertise(formats) => {
             // SAFETY: as above.
@@ -1062,6 +1141,116 @@ unsafe fn send_refresh(ctx: *mut sys::rdpContext) {
             bottom: (*gdi).height.max(0) as u16,
         };
         refresh(ctx, 1, &rect);
+    }
+}
+
+/// Route a resize to whichever mechanism this session survives.
+///
+/// The default is MS-RDPEDISP: a monitor layout, answered by a graphics reset over EGFX and by
+/// a Deactivation-Reactivation Sequence on the legacy path, either way with the session, its
+/// channels and its sound intact. One server breaks that bargain: a Windows host drives
+/// MS-RDPEA over `AUDIO_PLAYBACK_DVC`, and its audio redirector does not survive the
+/// reactivation a legacy resize costs — measured mid-playback against a Windows 11 host, five
+/// resizes of six left the channel open and mute, the last wave landing within a second of the
+/// reactivation, with no close, no re-announced formats, and nothing in MS-RDPEA for a client
+/// to restart it with. Every remedy short of reconnecting was tried against that host and
+/// measured dead: a client-side channel close is never answered with a new create, withholding
+/// wave confirms quiesces nothing, and a server whose dynamic create is refused never falls
+/// back to the static channel it also joined.
+///
+/// So a session bearing that server's mark — no graphics pipeline, and sound negotiated on the
+/// dynamic transport — resizes the way Guacamole's `resize-method: reconnect` does: the
+/// connection comes down and back up at the new size, renegotiating the channels and the sound
+/// with it, in about 800 ms against the same host. Everyone else keeps the layout, which is
+/// cheaper and already survives: xrdp's static-channel audio rides out its reactivation, a
+/// session with no sound has nothing to lose to one, and an EGFX resize is not a reactivation
+/// at all.
+///
+/// # Safety
+///
+/// `ctx` must be live and connected.
+unsafe fn resize(ctx: *mut sys::rdpContext, width: u32, height: u32, scale_percent: u32) {
+    // SAFETY: the caller guarantees the context.
+    let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
+    // SAFETY: settings are live on a live context.
+    let egfx = unsafe {
+        sys::freerdp_settings_get_bool(
+            (*ctx).settings,
+            sys::FreeRDP_Settings_Keys_Bool::FreeRDP_SupportGraphicsPipeline,
+        )
+    } != 0;
+    if !egfx && bridge.audio_dynamic_negotiated {
+        // Only superseded, never sent directly: the event loop performs it once
+        // `RECONNECT_DEBOUNCE` passes without a newer size, so a window drag costs one
+        // reconnect rather than one per report.
+        bridge.pending_reconnect =
+            Some(PendingReconnect { width, height, scale_percent, since: Instant::now() });
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { request_resize(ctx, width, height, scale_percent) };
+}
+
+/// The resize that reconnects: down, the new size into settings, up, and then by hand the same
+/// bookkeeping a `DesktopResize` would have driven.
+///
+/// Three details are load-bearing. **The GDI survives the reconnect** — `freerdp_reconnect`
+/// re-runs the connect sequence but never `PostConnect`, so freeing the GDI here leaves
+/// `context->cache` null and the first pointer update after the reconnect dereferences it.
+/// **No `DesktopResize` fires on the way back up**, because the server activates at exactly the
+/// size settings already hold — the `desktop_resize` call below is that event, run by hand, and
+/// it reads the size back out of settings so a server that activated at some *other* size is
+/// still followed rather than fought. And **the device count restarts**, because the reconnect
+/// runs the channel bring-up again and the next `rdpsnd` device minted belongs to the static
+/// channel.
+///
+/// # Safety
+///
+/// `ctx` must be live and connected, and this must be the FreeRDP thread, between event-loop
+/// iterations — nothing else may be inside the instance while it reconnects.
+unsafe fn reconnect_resize(
+    ctx: *mut sys::rdpContext,
+    width: u32,
+    height: u32,
+    scale_percent: u32,
+) -> bool {
+    unsafe {
+        let instance = (*ctx).instance;
+        // One line on stderr, because this is the expensive kind of resize and the embedder's
+        // logs should say so rather than leave an ~800 ms freeze unexplained.
+        eprintln!(
+            "freerdp: resizing to {width}x{height} by reconnect — this session's sound would \
+             not survive a reactivation"
+        );
+        if sys::freerdp_disconnect_before_reconnect_context(ctx) == 0 {
+            eprintln!("freerdp: could not take the session down for a resize-by-reconnect");
+            return false;
+        }
+        if let Some(bridge) = bridge(ctx) {
+            bridge.audio_devices_seen = 0;
+        }
+        use sys::FreeRDP_Settings_Keys_UInt32 as U;
+        let settings = (*ctx).settings;
+        // The density rides the connect itself: DesktopScaleFactor is the field a monitor
+        // layout would have carried, and DeviceScaleFactor stays the 100 the layout builder
+        // uses. `Input::resize` has already clamped the scale to what the wire allows.
+        let sizes = [
+            (U::FreeRDP_DesktopWidth, width),
+            (U::FreeRDP_DesktopHeight, height),
+            (U::FreeRDP_DesktopScaleFactor, scale_percent),
+            (U::FreeRDP_DeviceScaleFactor, 100),
+        ];
+        for (key, value) in sizes {
+            if sys::freerdp_settings_set_uint32(settings, key, value) == 0 {
+                eprintln!("freerdp: a resize-by-reconnect setting was rejected");
+                return false;
+            }
+        }
+        if sys::freerdp_reconnect(instance) == 0 {
+            eprintln!("freerdp: the reconnect half of a resize-by-reconnect failed");
+            return false;
+        }
+        desktop_resize(ctx) != 0
     }
 }
 
