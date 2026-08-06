@@ -385,11 +385,21 @@ fn resize_check(
     let (want_width, want_height, want_scale) = (801, 600, 200);
     println!("resize          asking for {want_width}x{want_height} at {want_scale}%");
     session.input().resize(want_width, want_height, want_scale);
-    let asked = Instant::now();
+    let mut asked = Instant::now();
 
     let mut ready = ready;
     let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
+        // The re-ask below is paced by the wall clock, not by the event queue going quiet: a
+        // desktop that happens to be animating delivers paints continuously, and a retry that
+        // waited for a 5-second gap in events would never fire against it — measured, against a
+        // host that was playing a video, where the one early layout was dropped and the "retry"
+        // starved for the whole 45-second deadline.
+        if ready && asked.elapsed() > Duration::from_secs(5) {
+            println!("resize          asking again, {:?} in", asked.elapsed());
+            session.input().resize(want_width, want_height, want_scale);
+            asked = Instant::now();
+        }
         let event = match events.recv_timeout(Duration::from_secs(5)) {
             Ok(event) => event,
             // The session thread always sends `Ended` before it drops the sender, and the arm
@@ -401,20 +411,15 @@ fn resize_check(
                         .into(),
                 )
             }
-            Err(RecvTimeoutError::Timeout) => {
-                // **Asking again is not belt-and-braces, it is the protocol.** A Windows 11 host
-                // ignores a monitor layout sent while it is still bringing the session up, and
-                // says nothing about having done so — measured here: the same 800x600 layout was
-                // dropped 400 ms after the capabilities PDU and honoured 6.7 s in, on the same
-                // host in the same session. There is no observable "ready now", so the only thing
-                // a client can do is ask again, which is what an embedder driving this from a
-                // viewport must also do. See `Input::resize`.
-                if ready {
-                    println!("resize          asking again, {:?} in", asked.elapsed());
-                    session.input().resize(want_width, want_height, want_scale);
-                }
-                continue;
-            }
+            // **Asking again is not belt-and-braces, it is the protocol.** A Windows 11 host
+            // ignores a monitor layout sent while it is still bringing the session up, and
+            // says nothing about having done so — measured here: the same 800x600 layout was
+            // dropped 400 ms after the capabilities PDU and honoured 6.7 s in, on the same
+            // host in the same session. There is no observable "ready now", so the only thing
+            // a client can do is ask again — paced above, where an animating desktop cannot
+            // starve it — which is what an embedder driving this from a viewport must also do.
+            // See `Input::resize`.
+            Err(RecvTimeoutError::Timeout) => continue,
         };
         match event {
             Event::ResizeReady { max_monitors, max_area } => {
