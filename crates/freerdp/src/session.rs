@@ -800,20 +800,23 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // boundary comes out of `end_paint`.)
         (B::FreeRDP_FrameMarkerCommandEnabled, true),
         (B::FreeRDP_SurfaceFrameMarkerEnabled, true),
-        // **Full window drag stays on**, which is what a LAN declaration means. Turned
-        // off, Windows draws a rubber-band outline instead of the window while it is
-        // being dragged — and on a remote desktop that does not read as a bandwidth
-        // saving, it reads as the drag having stopped working. It is the same fault the
-        // `ConnectionType` above was measured against, seen by a person rather than by a
-        // probe, and asking for it while declaring a LAN would be this crate arguing
-        // with itself.
-        (B::FreeRDP_DisableFullWindowDrag, false),
-        // Menu fades do not survive being re-encoded as tiles well enough to be worth
-        // the frames, and nothing about them is load-bearing the way a drag is.
+        // The performance flags, at guacamole-server's defaults: wallpaper, theming, full-window
+        // drag and menu animations all off. Core derives the wire value from these booleans —
+        // `freerdp_performance_flags_make`, called as the extended info packet is written — so
+        // the booleans are the only thing to set.
+        //
+        // Full-window drag was **on** until 2026-08-06, argued from the LAN declaration above:
+        // the rubber-band outline a disabled drag leaves reads as the drag having stopped
+        // working. The source comparison against guacd overturned that: every position of a
+        // dragged window is a full window of damage through decode, diff, encode, socket and
+        // paint — one gesture priced at more traffic than minutes of typing, all for pixels
+        // that are gone the moment the drag ends. It was the single cheapest damage lever the
+        // comparison found, and damage that is never created needs no other optimization
+        // downstream. Wallpaper and theming go for the same reason at smaller stakes.
+        (B::FreeRDP_DisableWallpaper, true),
+        (B::FreeRDP_DisableFullWindowDrag, true),
         (B::FreeRDP_DisableMenuAnims, true),
-        // Themes are *not* disabled: an unthemed Windows desktop is jarring in a way that reads
-        // as a broken client rather than as a bandwidth saving.
-        (B::FreeRDP_DisableThemes, false),
+        (B::FreeRDP_DisableThemes, true),
     ];
     for (key, value) in bools {
         // SAFETY: `settings` is live; these keys are all Bool keys by construction.
