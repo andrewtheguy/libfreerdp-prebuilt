@@ -111,15 +111,24 @@ pub struct Connect {
     /// that knows whether its users want the feature more than they want the session to survive.
     ///
     /// FreeRDP handles the reactivation itself, inside `freerdp_check_event_handles` — this crate
-    /// sees only a [`Event::Resize`] afterwards.
-    ///
-    /// Turning this on also declines the graphics pipeline, and one kind of session then resizes
-    /// by *reconnecting* rather than by a monitor layout: a server whose sound arrived over the
-    /// dynamic `rdpsnd` transport, which is a Windows host, whose audio redirector does not
-    /// survive the legacy path's reactivation. The reconnect renegotiates the channels and the
-    /// sound with them, and still surfaces as the one [`Event::Resize`]. See `resize` in this
-    /// module for the measurements.
+    /// sees only a [`Event::Resize`] afterwards. (Under [`Connect::egfx`] there is no
+    /// reactivation at all: the layout costs a graphics reset instead.)
     pub resize: bool,
+    /// Whether to advertise the graphics pipeline (EGFX), with RemoteFX riding beside it. On by
+    /// default, and deliberately independent of [`Connect::resize`] — the two used to be one
+    /// switch, and the coupling is now the embedder's trade to make:
+    ///
+    /// With the pipeline, a monitor layout is answered by a graphics reset — no
+    /// Deactivation-Reactivation, channels and sound untouched — but a Windows host then renders
+    /// text that stays blurry for the rest of the session (observed repeatedly by the person
+    /// using it). Without the pipeline, the same layout costs a full reactivation after which
+    /// the server renders the new desktop from scratch, sharp — and one kind of session then
+    /// resizes by *reconnecting* rather than by a layout: a server whose sound arrived over the
+    /// dynamic `rdpsnd` transport, which is a Windows host, whose audio redirector does not
+    /// survive the reactivation. The reconnect renegotiates the channels and the sound with
+    /// them, and still surfaces as the one [`Event::Resize`]. See `resize` in this module for
+    /// the measurements.
+    pub egfx: bool,
     pub connect_timeout: Duration,
     pub keepalive: KeepAlive,
 }
@@ -138,6 +147,7 @@ impl Default for Connect {
             clipboard: true,
             audio: None,
             resize: false,
+            egfx: true,
             connect_timeout: Duration::from_secs(15),
             keepalive: KeepAlive::default(),
         }
@@ -793,28 +803,23 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // callbacks when `gdi_graphics_pipeline_init` reads it, which is a headless server-side
         // recorder's setting, not a client's.
         (B::FreeRDP_DeactivateClientDecoding, false),
-        // **The graphics pipeline is advertised only for a fixed-size session, and RemoteFX
-        // rides beside it either way it goes.** Two measurements own this pair, one per
-        // direction. The pipeline alone was measured broken: against a Windows 11 host, FreeRDP
-        // decoded 21 surface commands with no errors and produced exactly one `EndPaint` over a
-        // framebuffer that summed to pure black. The missing piece was a codec next to the
-        // pipeline flag — guacamole-server ships exactly `SupportGraphicsPipeline` +
-        // `RemoteFxCodec` against the same Windows generation — and with both advertised the
-        // same e2e that measured black measures 3,090,403 non-zero bytes of 3,145,728, resizes,
-        // and disconnects cleanly. Keep the two together: the pipeline without a codec beside
-        // it is the black screen again.
+        // **The graphics pipeline is the embedder's `egfx` switch, and RemoteFX rides beside it
+        // either way it goes.** The pipeline alone was measured broken: against a Windows 11
+        // host, FreeRDP decoded 21 surface commands with no errors and produced exactly one
+        // `EndPaint` over a framebuffer that summed to pure black. The missing piece was a codec
+        // next to the pipeline flag — guacamole-server ships exactly
+        // `SupportGraphicsPipeline` + `RemoteFxCodec` against the same Windows generation — and
+        // with both advertised the same e2e that measured black measures 3,090,403 non-zero
+        // bytes of 3,145,728, resizes, and disconnects cleanly. Keep the two together: the
+        // pipeline without a codec beside it is the black screen again.
         //
-        // A *resizable* session declines the pipeline, because of what each path does to the
-        // desktop after a size change. Over EGFX a resize is a graphics reset, and a Windows
-        // host answers it with text that stays blurry for the rest of the session — observed
-        // repeatedly by the person using it, and the reason this gate exists. On the legacy
-        // path the same request costs a full Deactivation-Reactivation Sequence, after which
-        // the server renders the new desktop from scratch, sharp. The reactivation is the
-        // event a Windows host's audio redirector does not survive — which is what had kept
-        // the pipeline on for every session. A session in that position resizes by
-        // reconnecting instead; `resize` below tells that story.
-        (B::FreeRDP_SupportGraphicsPipeline, !config.resize),
-        (B::FreeRDP_RemoteFxCodec, !config.resize),
+        // This pair used to read `!config.resize`, gating the pipeline off every resizable
+        // session, because of what each path does to the desktop after a size change — see
+        // [`Connect::egfx`] for that trade (blurry Windows text under a graphics reset against
+        // a reactivation per resize without it). The gate is now the embedder's, made once in
+        // config rather than inferred here.
+        (B::FreeRDP_SupportGraphicsPipeline, config.egfx),
+        (B::FreeRDP_RemoteFxCodec, config.egfx),
         // Dynamic resize. This one key is also what *loads* the channel: the addin table in
         // `client/common/cmdline.c` maps `FreeRDP_SupportDisplayControl` to `disp`, and
         // `freerdp_client_load_channels` — installed as `LoadChannels` by

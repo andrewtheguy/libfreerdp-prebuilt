@@ -138,7 +138,10 @@ wrong pixel, and it is the same shape for everybody who embeds it.
 
 Dynamic resize is there but **off by default** (`Connect::resize`), because a server answers a
 monitor layout by renegotiating the whole session — the most disruptive thing a client can ask
-for, and a session that never asks never meets it.
+for, and a session that never asks never meets it. The graphics pipeline is its own switch
+(`Connect::egfx`, on by default) rather than an inference from `resize`: under EGFX a layout costs
+a graphics reset instead of that renegotiation, at the price of a Windows host rendering text that
+stays soft afterwards — the embedder picks which failure it can live with.
 
 Sound is off by default too (`Connect::audio`), and arrives differently from everything else: not
 as an `Event` but through an `AudioSink` called on the FreeRDP thread, so a wave buffer never
@@ -158,12 +161,13 @@ The one thing that is not per-session is the addin provider FreeRDP finds a devi
 device away from it, leaving it silent. Sessions that overlap only after both have connected are
 unaffected, because by then each has loaded its own device.
 
-What it does **not** do, deliberately: no microphone, no graphics pipeline, no certificate
-verification, no file-transfer clipboard, no multiple monitors, and no retrying of a resize. Each
-of those is documented where it is decided, with the reason. The EGFX one is worth repeating: against a Windows 11 host with the
-graphics pipeline advertised, FreeRDP decoded 21 surface commands with no errors and produced a
-framebuffer that summed to *exactly* black; with `SupportGraphicsPipeline = FALSE` the same host,
-the same build and the same second painted a real desktop.
+What it does **not** do, deliberately: no microphone, no certificate verification, no
+file-transfer clipboard, no multiple monitors, and no retrying of a resize. Each of those is
+documented where it is decided, with the reason. One EGFX measurement is worth repeating: the
+pipeline flag needs a codec beside it — against a Windows 11 host with `SupportGraphicsPipeline`
+advertised alone, FreeRDP decoded 21 surface commands with no errors and produced a framebuffer
+that summed to *exactly* black; with `RemoteFxCodec` beside it the same host painted a real
+desktop, which is why `apply_settings` sets the pair together.
 
 ## Local loop
 
