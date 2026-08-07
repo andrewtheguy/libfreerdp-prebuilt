@@ -46,10 +46,13 @@ is only the things that are easy to get wrong.
 - **Turning sound on makes a Windows host start measuring the link.** Measured: with `rdpsnd`
   loaded, a Windows 11 host began continuous network characteristics detection within seconds and
   the session died **five times out of five** — `autodetect_recv_request_packet` answers a request
-  it was not configured for with `STATE_RUN_FAILED`. Declining `NetworkAutoDetect` is not enough,
-  because the MCS message channel those PDUs arrive on is opened by `SupportMultitransport` or
-  `SupportHeartbeatPdu` too, and both default to on. All three are off together in
-  `apply_settings`, and they have to stay that way.
+  it was not configured for with `STATE_RUN_FAILED`. Declining `NetworkAutoDetect` does not stop
+  the asking, because the MCS message channel those PDUs arrive on is opened by
+  `SupportMultitransport` or `SupportHeartbeatPdu` too. **All three move together**: on, which is
+  FreeRDP's default and what guacamole-server ships, and the session survives being asked because
+  it answers. The arrangement that must never exist is half of each — a message channel open with
+  `NetworkAutoDetect` false is the configuration that died 5/5. `apply_settings` carries the rest
+  of the argument, including the drag that detection throttled into 12 batches.
 - **cliprdr and disp callbacks return a channel error code, where 0 is success** — the opposite of
   every other callback in the wrapper. Returning 1 from `MonitorReady` tears the session down and
   surfaces to the caller as an orderly `Ended(Ok(()))` a second after connecting.

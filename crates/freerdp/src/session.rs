@@ -51,8 +51,9 @@ pub enum Security {
 /// FreeRDP applies these itself in `libfreerdp/core/tcp.c` — `TCP_KEEPIDLE`, `TCP_KEEPINTVL`,
 /// `TCP_KEEPCNT` and, on Linux, `TCP_USER_TIMEOUT` — so an embedder does not need to reach for
 /// the socket. They matter more than they look: without them a session whose peer vanished
-/// without a FIN sits in `WaitForMultipleObjects` indefinitely, and the user sees a frozen
-/// desktop rather than a disconnection.
+/// without a FIN never learns that it did — the event loop goes on waking on
+/// [`POLL_INTERVAL`] and finding a quiet socket, which is indistinguishable from an idle
+/// desktop — and the user sees a frozen desktop rather than a disconnection.
 #[derive(Clone, Copy, Debug)]
 pub struct KeepAlive {
     /// Idle time before the first probe.
@@ -711,23 +712,16 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         (U::FreeRDP_TcpKeepAliveInterval, seconds(config.keepalive.interval)),
         (U::FreeRDP_TcpKeepAliveRetries, config.keepalive.retries),
         (U::FreeRDP_TcpAckTimeout, millis(config.keepalive.ack_timeout)),
-        // **The link is a LAN, and we say so rather than letting the server measure it.**
+        // **The link is declared a LAN**, which is the value guacamole-server sends too
+        // (`settings.c`) and for the reason a gateway has and a laptop does not: it sits
+        // beside the hosts it serves and re-encodes for whatever link the *browser* is
+        // on, which this end already paces itself. The server's opening assumption about
+        // this hop should be the good one.
         //
-        // FreeRDP defaults this to `CONNECTION_TYPE_AUTODETECT` with
-        // `NetworkAutoDetect` on, which turns on MS-RDPBCGR's Network Characteristics
-        // Detection: the server times round trips and a bandwidth payload, and paces
-        // its own updates from the answer. Measured against a Windows 11 host over a
-        // tunnelled IPv6 link, that pacing collapsed — a five-second scripted drag
-        // arrived in as few as 12 batches, with 95% of its 100 ms buckets carrying no
-        // update at all, and whole seconds in which the server sent nothing while the
-        // client sent 56 input events. The same drag against xrdp, which implements no
-        // auto-detect, painted continuously throughout.
-        //
-        // A gateway is not a laptop on hotel wifi: it sits beside the hosts it serves
-        // and re-encodes for whatever link the *browser* is on, which this end already
-        // paces itself. So the server's estimate of *this* hop is both wrong and
-        // unhelpful, and the honest thing is to declare the link rather than have it
-        // guessed at.
+        // It is an opening assumption and not a settlement. With `NetworkAutoDetect` on
+        // below the server measures the hop and overrides this with what it found, and
+        // the history of that trade — including the run where the override collapsed a
+        // drag into 12 batches — is on `FreeRDP_NetworkAutoDetect`, where it belongs.
         (U::FreeRDP_ConnectionType, sys::CONNECTION_TYPE_LAN),
     ];
     for (key, value) in uints {
@@ -752,33 +746,56 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // on lets a server talk this client into a mode it was explicitly not given.
         (B::FreeRDP_NegotiateSecurityLayer, config.security == Security::Auto),
         (B::FreeRDP_TcpKeepAlive, true),
-        // The other half of the LAN declaration above: with auto-detect on, the
-        // `ConnectionType` is only a starting guess the server then overrides with what
-        // it measured, so leaving this true would give the throttling back.
-        (B::FreeRDP_NetworkAutoDetect, false),
-        // **And the third half, which declining auto-detect does not buy on its own.**
+        // **Network Characteristics Detection is answered rather than declined.**
         //
-        // Saying no to network detection stops this client *advertising*
-        // `RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT`, and stops nothing else: the MCS message
-        // channel that the detection PDUs travel on is opened by any of these three
-        // settings (`gcc_write_client_message_channel_data`), and both of the others
-        // default to on. A Windows host then sends a continuous RTT Measure Request down
-        // it anyway — and `autodetect_recv_request_packet` answers a request it was not
-        // configured for with `STATE_RUN_FAILED`, which ends the session.
+        // This is FreeRDP's default and what every other client in the comparison ships:
+        // guacamole-server never clears it, and its `CONNECTION_TYPE_LAN` does not clear
+        // it either — `freerdp_set_connection_type`'s table (`client/common/cmdline.c`)
+        // carries only the six performance booleans, so guacd and xfreerdp `/network:lan`
+        // both run Windows sessions with detection on and answer every probe.
         //
-        // Measured, and the reason this is here rather than in a note: with `rdpsnd`
-        // loaded, a Windows 11 host began that detection within seconds of the desktop
-        // going active and killed the session **five times out of five**; the same host,
-        // the same build and the same seconds with no audio channel did it in none of
-        // three. Turning sound on is what makes the server start caring how fast the link
-        // is, so a client that has declined to answer must also decline to be asked.
+        // Two measurements argue for declining it instead, and neither is wrong about
+        // what it saw:
         //
-        // What is given up: multitransport is UDP side-channels this crate never sets up,
-        // and the heartbeat is a liveness signal the TCP keepalives above already provide
-        // — with `TcpAckTimeout` bounding an unacknowledged write, which is the case a
-        // heartbeat would have caught.
-        (B::FreeRDP_SupportMultitransport, false),
-        (B::FreeRDP_SupportHeartbeatPdu, false),
+        // 1. With detection on, a Windows 11 host over a tunnelled IPv6 link paces its
+        //    updates from what it measured and the pacing collapses — a five-second
+        //    scripted drag arrived in as few as 12 batches, 95% of its 100 ms buckets
+        //    carrying no update at all, and whole seconds with nothing sent while the
+        //    client sent 56 input events. The same drag against xrdp, which implements
+        //    no auto-detect at all, painted continuously throughout.
+        // 2. Declining detection does not stop the asking. It stops this client
+        //    advertising `RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT` and stops nothing else:
+        //    the MCS message channel those PDUs travel on is opened by any of these three
+        //    settings (`gcc_write_client_message_channel_data`, `core/gcc.c`), and the
+        //    other two default to on. With `rdpsnd` loaded — sound is what makes a
+        //    Windows host start caring how fast the link is — that host probes anyway
+        //    within seconds, and `autodetect_recv_request_packet` answers a request it
+        //    was not configured for with `STATE_RUN_FAILED`. The session died five times
+        //    out of five.
+        //
+        // Neither measures the arrangement everyone else ships: the channel open *and*
+        // the answers given. (2) ran with the answering switched off, which is the one
+        // combination guaranteed to fail — FreeRDP's client side is complete, with
+        // `core/autodetect.c` replying to RTT, bandwidth start/payload/stop and netchar
+        // results. And (1) is a server pacing itself from a true measurement of a bad
+        // hop: sparse, but moving, and recovering.
+        //
+        // The fault this is aimed at is neither. A Windows host stops sending graphics
+        // outright — audio, input and cursor updates all still flowing, on EGFX and on
+        // the legacy path alike — and never recovers. Leaving that host no measurement to
+        // pace from is the one thing on the graphics path this client can do and guacd
+        // does not, which is why the answers are given. If (1)'s throttling appears
+        // instead it reads as sparse-but-moving rather than stopped, and `ConnectionType`
+        // above is the dial for it.
+        (B::FreeRDP_NetworkAutoDetect, true),
+        // The other two openers of that message channel, back at FreeRDP's defaults and
+        // guacd's behaviour. Neither carries weight on its own: this crate sets up no UDP
+        // side channel and `multitransport_no_udp` declines the server's invitation with
+        // `E_ABORT` (`core/multitransport.c`), while a heartbeat with no `ServerHeartbeat`
+        // callback is an `IFCALLRESULT(TRUE, …)` that does nothing. Their only real effect
+        // is on that message channel, and it is wanted open.
+        (B::FreeRDP_SupportMultitransport, true),
+        (B::FreeRDP_SupportHeartbeatPdu, true),
         (B::FreeRDP_RedirectClipboard, config.clipboard),
         // Sound. Like the clipboard's key this is both the capability and the channel switch —
         // `freerdp_client_load_addins` maps it to `rdpsnd` — but unlike the clipboard's it is not
@@ -952,6 +969,18 @@ fn subscribe_channels(ctx: *mut sys::rdpContext) -> Result<(), Error> {
 /// FreeRDP's own limit on how many handles it will report.
 const MAX_HANDLES: usize = 64;
 
+/// The longest this loop waits before checking FreeRDP's handles anyway, in milliseconds.
+///
+/// Nothing known requires it, and an infinite wait *should* be safe: `transport_check_fds`
+/// consumes one PDU per call and re-arms `transport->rereadEvent` while anything is left
+/// (`core/transport.c`), so bytes buffered inside TLS signal a handle rather than sitting unseen.
+/// This is guacamole-server's number (`GUAC_RDP_MESSAGE_CHECK_INTERVAL`, `client.h`) taken for
+/// guacamole-server's property rather than for a known bug: an edge missed anywhere in that chain
+/// costs guacd one second and costs an infinite wait the remainder of the session. While a freeze
+/// with graphics stopped and every other path alive is still unexplained, that difference is worth
+/// one wakeup a second on an idle desktop.
+const POLL_INTERVAL: u32 = 1000;
+
 fn event_loop(ctx: *mut sys::rdpContext) -> Result<(), Error> {
     // SAFETY: `ctx` is live and connected.
     let bridge_ref = unsafe { bridge(ctx) }.ok_or_else(|| Error::local("the bridge is missing"))?;
@@ -977,15 +1006,16 @@ fn event_loop(ctx: *mut sys::rdpContext) -> Result<(), Error> {
             };
         }
 
-        // A pending reconnect-resize turns the infinite wait into its debounce remainder, so
-        // the loop wakes to perform it even if the wire and the caller both go quiet.
+        // A pending reconnect-resize shortens the wait to its debounce remainder, so the loop
+        // wakes to perform it even if the wire and the caller both go quiet. Absent one, the
+        // wait is [`POLL_INTERVAL`] rather than infinite — see there for what that buys.
         // SAFETY: `ctx` is live; the borrow ends before any call back into FreeRDP.
         let timeout = match unsafe { bridge(ctx) }.and_then(|b| b.pending_reconnect.as_ref()) {
             Some(pending) => {
                 let left = RECONNECT_DEBOUNCE.saturating_sub(pending.since.elapsed());
-                (left.as_millis() as u32).max(1)
+                (left.as_millis() as u32).clamp(1, POLL_INTERVAL)
             }
-            None => sys::INFINITE,
+            None => POLL_INTERVAL,
         };
         // SAFETY: `handles` holds `count + 1` valid handles, which is what is passed.
         let status = unsafe {
