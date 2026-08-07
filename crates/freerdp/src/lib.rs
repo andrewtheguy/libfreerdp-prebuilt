@@ -60,8 +60,9 @@
 //! - **No microphone.** `rdpsnd` carries the remote's sound *out*; `audin` would carry a local
 //!   one in, and it is not built into the archives. A headless gateway has no microphone anyway —
 //!   whatever it forwarded would be somebody else's, over a link.
-//! - **No graphics pipeline.** `FreeRDP_SupportGraphicsPipeline` is set to `FALSE`, deliberately
-//!   and with a measurement behind it — see [`Connect`].
+//! - **No graphics pipeline unless asked.** `FreeRDP_SupportGraphicsPipeline` is off by default,
+//!   and the experimental [`Connect::egfx`] is the only thing that turns it on — the reasons,
+//!   measured and otherwise, are on that field.
 //! - **No certificate verification.** Also deliberate, also documented on [`Connect`]. Read that
 //!   before using this on a network you do not control.
 //! - **No file-transfer clipboard.** Formats and their bytes cross; `CB_STREAM_FILECLIP_ENABLED`
