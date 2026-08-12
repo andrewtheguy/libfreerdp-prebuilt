@@ -157,6 +157,14 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         // On for the resize leg below, and this is the only place in the repository that turns it
         // on — `Connect::resize` says why it is off by default.
         resize: true,
+        // `E2E_EGFX=0` runs the same legs down the **legacy orders path** instead of the graphics
+        // pipeline. The caches in `apply_settings` take effect only on that path, and until this
+        // knob existed this program hardcoded itself out of reaching it — a test that reaches one
+        // of the two paths cannot exercise a setting that lives on the other. That is the whole
+        // reason it is here, and it is *not* that the measurement needed it: an embedder reaches
+        // the same path through its own configuration, and remotex printed the same
+        // `update_dump_stats` counters under `WLOG_LEVEL=TRACE` with `egfx = false` on a target.
+        egfx: std::env::var("E2E_EGFX").as_deref() != Ok("0"),
         audio: Some(Audio { format: AudioFormat::CD, sink: recorder.clone() }),
         ..Connect::default()
     });

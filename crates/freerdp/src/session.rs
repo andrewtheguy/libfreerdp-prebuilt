@@ -739,6 +739,11 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // unhelpful, and the honest thing is to declare the link rather than have it
         // guessed at.
         (U::FreeRDP_ConnectionType, sys::CONNECTION_TYPE_LAN),
+        // The offscreen bitmap cache — the other half of the client-side caches enabled with
+        // `FreeRDP_BitmapCacheEnabled` below, where the shared reasoning lives. Level 1 is the
+        // whole of what MS-RDPEGDI defines; `freerdp_settings_new` sets this key to 0 and sizes
+        // the cache anyway (7680 KB, 2000 entries), so the switch is the only thing to set.
+        (U::FreeRDP_OffscreenSupportLevel, 1),
     ];
     for (key, value) in uints {
         // SAFETY: `settings` is live; these keys are all UInt32 keys by construction.
@@ -868,6 +873,57 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         (B::FreeRDP_DisableFullWindowDrag, true),
         (B::FreeRDP_DisableMenuAnims, true),
         (B::FreeRDP_DisableThemes, true),
+        // **The legacy path's client-side caches, which FreeRDP 3 ships off.** The bitmap cache
+        // lets the server store a tile in this client's memory once and repaint it later with a
+        // MEMBLT order naming a cache slot; the offscreen cache (its uint32 switch is above) lets
+        // it compose into a client-side surface and blit from that. Both replace retransmitted
+        // pixels with a reference to pixels the client already holds — repeated UI, re-exposed
+        // window regions, scrolled content — and damage that never crosses the wire needs no
+        // other optimization downstream. guacd enables both by default; FreeRDP 3's
+        // `freerdp_settings_new` leaves this key zeroed (only a Windows registry hook can set
+        // it) and explicitly sets `OffscreenSupportLevel` to 0, so without these two lines every
+        // session ran with both caches off.
+        //
+        // Two settings are genuinely the whole change. The order capability writes
+        // `settings->OrderSupport` verbatim, but `freerdp_connect_begin` recomputes that table
+        // from these settings at connect time (`freerdp_settings_set_default_order_support`,
+        // libfreerdp/core/freerdp.c) — MEMBLT and MEM3BLT follow this boolean. And the client
+        // half is core's: `gdi_init` below creates the cache module and registers the offscreen
+        // callbacks, so a cache hit surfaces to the embedder as ordinary damage.
+        //
+        // Set unconditionally, not gated on `egfx`: they are capabilities of the legacy orders
+        // channel, which is what an EGFX-off session speaks *and* what an EGFX-on session falls
+        // back to when a server declines the pipeline. A server driving EGFX ignores them.
+        //
+        // **Measured** with `E2E_EGFX=0 WLOG_LEVEL=TRACE cargo run -p freerdp-e2e`, reading
+        // FreeRDP's own end-of-session `update_dump_stats`, twice each way against a Windows 11
+        // host. Without these two settings that host sent **no drawing orders at all** — 71 and 72
+        // raw `RDP_STATS_BITMAP_UPDATE`, every one of them pixels. With them it sent no raw bitmap
+        // update at all: 1941 and 1945 MemBlt orders drawn out of 574 and 587 cached bitmaps, so
+        // roughly two of every three blits repainted from memory the client already held. Denying
+        // a server the cache does not make it send the same picture more cheaply some other way;
+        // it makes it stop using orders and push pixels.
+        //
+        // The same four runs against xrdp, a different server family and the check that this is
+        // not one vendor's quirk: 0 orders and 5 raw bitmap updates without, 960 MemBlt orders
+        // over 156 and 337 cached bitmaps and no raw update at all with. The shape is identical
+        // even though that desktop is far quieter — it is the server's *choice of mechanism* that
+        // moves, not the amount it had to draw.
+        //
+        // A second effect, not looked for, and it belongs to the Windows host alone: with the
+        // caches off it marked **no frame boundaries** on this path, and with them on it marked
+        // 134 and 136. The ALTSEC frame marker is an order, so it cannot arrive on a connection
+        // sending no orders — but orders are only necessary and not sufficient, because xrdp
+        // marked nothing in any of its four runs while sending 960 of them. So
+        // `FrameMarkerCommandEnabled` above reaches the legacy path only through these settings
+        // and only on a server that implements the marker; a consumer still needs its own
+        // fallback for the boundaries, and xrdp is the server that proves it.
+        //
+        // The third cache of this family, glyphs, stays at its `GLYPH_SUPPORT_NONE` default on
+        // purpose: guacd forces it off regardless of settings (GUACAMOLE-1191), and this
+        // FreeRDP's own settings warning calls a non-NONE level "[experimental] … expect visual
+        // artefacts".
+        (B::FreeRDP_BitmapCacheEnabled, true),
     ];
     for (key, value) in bools {
         // SAFETY: `settings` is live; these keys are all Bool keys by construction.
