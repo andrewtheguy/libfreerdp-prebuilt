@@ -744,6 +744,25 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // whole of what MS-RDPEGDI defines; `freerdp_settings_new` sets this key to 0 and sizes
         // the cache anyway (7680 KB, 2000 entries), so the switch is the only thing to set.
         (U::FreeRDP_OffscreenSupportLevel, 1),
+        // **The glyph cache, the third cache of the family below — announced because declining
+        // it does not keep glyph orders away, it only makes them fatal.** xrdp does not read
+        // the order capability glyph by glyph: give it any orders at all (which
+        // `FreeRDP_BitmapCacheEnabled` below did) and its login screen paints its text through
+        // `CACHE_GLYPH`/`GLYPH_INDEX` regardless of a declared `GLYPH_SUPPORT_NONE`. Core
+        // answers the unannounced order with `STATE_RUN_FAILED` ("SERVER BUG",
+        // libfreerdp/core/orders.c), ending the session on the first glyph after the first
+        // bitmap update — measured with `freerdp-e2e` against xrdp 0.9.21 (Debian bookworm)
+        // showing its login screen, every run. `FreeRDP_AllowUnanouncedOrdersFromServer` was
+        // tried first and only moves the failure one step: the tolerated `CACHE_GLYPH` stores
+        // nothing while the glyph module is off, so the `GLYPH_INDEX` that follows dies in
+        // `glyph_cache_get` instead. Announcing FULL makes the same screen paint to completion
+        // and leaves a conformant server unaffected — the same Windows 11 host painted, marked
+        // frames and resized identically either way. What is given up: guacd forces this off
+        // citing rendering bugs (GUACAMOLE-1191), and this FreeRDP's settings warning calls a
+        // non-NONE level "[experimental] … expect visual artefacts" — artefacts confined to
+        // servers that draw with glyphs, which today is xrdp's own chrome, and imperfect text
+        // beats a dead session.
+        (U::FreeRDP_GlyphSupportLevel, sys::GLYPH_SUPPORT_FULL),
     ];
     for (key, value) in uints {
         // SAFETY: `settings` is live; these keys are all UInt32 keys by construction.
@@ -930,10 +949,9 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // and only on a server that implements the marker; a consumer still needs its own
         // fallback for the boundaries, and xrdp is the server that proves it.
         //
-        // The third cache of this family, glyphs, stays at its `GLYPH_SUPPORT_NONE` default on
-        // purpose: guacd forces it off regardless of settings (GUACAMOLE-1191), and this
-        // FreeRDP's own settings warning calls a non-NONE level "[experimental] … expect visual
-        // artefacts".
+        // The third cache of this family, glyphs, is `FreeRDP_GlyphSupportLevel` in the uint
+        // table above — announced, and not by preference: see there for why xrdp leaves no
+        // option to decline it once these orders are on.
         (B::FreeRDP_BitmapCacheEnabled, true),
     ];
     for (key, value) in bools {
