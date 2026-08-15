@@ -56,6 +56,14 @@ is only the things that are easy to get wrong.
 - **A static channel and a dynamic one arrive under different names.** `cliprdr` is matched on its
   8-character SVC name and `disp` on `Microsoft::Windows::RDS::DisplayControl`, which is what its
   plugin registered. Matching a DVC on its short name compiles and never fires.
+- **The camera is a whole DVC plugin of ours, not a compiled-in channel.** The archives build
+  `rdpecam` out on purpose — FreeRDP's implementation is a V4L capture stack plus an H.264
+  encoder, and this crate's camera source is the embedder's own encoded frames — so `camera.rs`
+  implements MS-RDPECAM itself over `drdynvc`, loaded through the same global addin provider that
+  serves the sound device. One provider answers for both names, deliberately: two chained
+  providers each capture "whatever was current" as upstream, so the later install would unhook
+  the earlier one's answers. Do not turn `CHANNEL_RDPECAM` on; the built-in client would contend
+  for the same listener names.
 - **A Windows host ignores a monitor layout sent early in a session, and says nothing.** Measured:
   the same 800x600 layout dropped 400 ms after that host's own DisplayControl capabilities PDU and
   honoured 6.7 s into the same session. There is no observable "ready now", so the retry belongs to
@@ -88,9 +96,13 @@ The second form is what proves the wrapper, and there is no substitute for it: c
 decoding, cursors, clipboard and resize are all things a unit test can only pretend to exercise.
 Run it against both a Linux xrdp and a real Windows host — they fail differently, and the Windows
 path is the one with CredSSP, NTLM, the graphics-pipeline decision and the layout timing in it.
-Three legs report rather than assert, because all three are properties of the *server*: resize
+Four legs report rather than assert, because all four are properties of the *server*: resize
 skips itself against a host with no DisplayControl, the clipboard says so if the channel is never
-offered, and audio says so if `rdpsnd` is not offered or the desktop simply made no noise. The
+offered, audio says so if `rdpsnd` is not offered or the desktop simply made no noise, and the
+camera says so if the host never opens the enumeration channel (policy can turn it off). The
+camera leg plugs a device and proves the handshake — negotiation, announcement, the host
+attaching the device channel — but feeds no sample: streaming needs an application on the host
+to open the camera, which is the half only a person can drive. The
 audio leg's one real assertion is that `negotiated` fired at all, which is how the `fake` device
 is told from this crate's — and to exercise the half only ears can settle, make the remote play
 something while it runs. The clipboard leg only drives the half a program can — it advertises a format and

@@ -22,7 +22,8 @@
 //! Exit code 0 means every check that ran passed. Anything else prints why.
 
 use freerdp::{
-    Audio, AudioFormat, AudioSink, ClipboardEvent, ClipboardFormat, Connect, Event, Session,
+    Audio, AudioFormat, AudioSink, Camera, CameraEvents, CameraFormat, ClipboardEvent,
+    ClipboardFormat, Connect, Event, Session,
 };
 
 /// `CF_UNICODETEXT`, Windows' own id for plain text. Named here rather than imported
@@ -141,12 +142,58 @@ impl AudioSink for Recorder {
     }
 }
 
+/// What the camera leg counts, from the FreeRDP thread. Atomics for the same reason as
+/// [`Recorder`]: every [`CameraEvents`] method runs on a thread that must not wait.
+#[derive(Default)]
+struct CamRecorder {
+    /// The negotiated MS-RDPECAM version, 0 until the host opened the enumeration channel.
+    negotiated: AtomicUsize,
+    /// Whether the host connected the device channel — the virtual camera installing.
+    attached: AtomicUsize,
+    started: AtomicUsize,
+    stopped: AtomicUsize,
+}
+
+impl CameraEvents for CamRecorder {
+    fn negotiated(&self, version: u8) {
+        println!("rdpecam         negotiated, protocol version {version}");
+        self.negotiated.store(version as usize, Ordering::Relaxed);
+    }
+
+    fn attached(&self) {
+        println!("rdpecam         the host attached the device channel");
+        self.attached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn started(&self, format: CameraFormat) {
+        println!(
+            "rdpecam         streaming started, {}x{} at {}/{} fps",
+            format.width, format.height, format.fps_numerator, format.fps_denominator
+        );
+        self.started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stopped(&self) {
+        println!("rdpecam         streaming stopped");
+        self.stopped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn keyframe_needed(&self) {}
+}
+
 /// The half that needs a server: connect, paint, disconnect.
 fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     println!();
     println!("connecting to {host}:{port} as {username}");
 
     let recorder = Arc::new(Recorder::new());
+    let cam_recorder = Arc::new(CamRecorder::default());
+    // Plugged before the connect, which is the documented license: the announcement waits for
+    // the enumeration channel and goes out by itself. No sample is ever fed here — streaming
+    // needs an application on the host to open the camera — so what this leg proves is the
+    // handshake: enumeration, announcement, and the host installing the device.
+    let camera = Camera::new("FreeRDP E2E Camera", cam_recorder.clone());
+    camera.plug(CameraFormat { width: 640, height: 480, fps_numerator: 30, fps_denominator: 1 });
     let (session, events) = Session::start(Connect {
         host: host.into(),
         port,
@@ -166,6 +213,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         // `update_dump_stats` counters under `WLOG_LEVEL=TRACE` with `egfx = false` on a target.
         egfx: std::env::var("E2E_EGFX").as_deref() != Ok("0"),
         audio: Some(Audio { format: AudioFormat::CD, sink: recorder.clone() }),
+        camera: Some(camera.clone()),
         ..Connect::default()
     });
 
@@ -278,6 +326,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let resize_failure = resize_check(&session, &events, resize_ready, width, height);
     await_audio(&recorder, &events);
     audio_check(&recorder);
+    camera_check(&cam_recorder);
     if let Some(why) = resize_failure {
         panic!("{why}");
     }
@@ -353,6 +402,33 @@ fn audio_check(recorder: &Recorder) {
         "rdpsnd          {buffers} wave buffers, {bytes} bytes, {:.2}s of sound",
         bytes as f64 / f64::from(AudioFormat::CD.byte_rate())
     );
+}
+
+/// The camera leg's verdicts, all reported rather than asserted, because every one is the
+/// server's to decide: whether camera redirection is enabled at all (policy can turn it off),
+/// whether the announced device gets installed, and whether anything on that desktop opened the
+/// camera while we watched. What the leg proves when the host cooperates is the whole
+/// MS-RDPECAM handshake this crate implements — enumeration, announcement, installation — with
+/// no sample ever fed, since samples need an application on the far side asking for them.
+fn camera_check(recorder: &CamRecorder) {
+    match recorder.negotiated.load(Ordering::Relaxed) {
+        0 => {
+            println!("rdpecam         not offered by this server");
+            return;
+        }
+        v => println!("rdpecam         negotiated at version {v}"),
+    }
+    match recorder.attached.load(Ordering::Relaxed) {
+        0 => println!("rdpecam         announced, but the host never attached the device"),
+        _ => println!("rdpecam         the announced device was attached by the host"),
+    }
+    let (started, stopped) = (
+        recorder.started.load(Ordering::Relaxed),
+        recorder.stopped.load(Ordering::Relaxed),
+    );
+    if started > 0 || stopped > 0 {
+        println!("rdpecam         streams started {started} time(s), stopped {stopped} time(s)");
+    }
 }
 
 /// Ask for a different desktop size, and see whether one arrives.
