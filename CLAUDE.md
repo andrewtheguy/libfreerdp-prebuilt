@@ -99,7 +99,10 @@ path is the one with CredSSP, NTLM, the graphics-pipeline decision and the layou
 Four legs report rather than assert, because all four are properties of the *server*: resize
 skips itself against a host with no DisplayControl, the clipboard says so if the channel is never
 offered, audio says so if `rdpsnd` is not offered or the desktop simply made no noise, and the
-camera says so if the host never opens the enumeration channel (policy can turn it off). The
+camera says so if the host never opens the enumeration channel — policy can turn it off, and
+**Windows Server never opens it** over plain RDP (measured on Server 2025, where Microsoft's own
+client gets no camera either; Media Foundation and the `fDisableCameraRedir` policy change
+nothing), so "not offered" against a Server host is the host's answer, not a client bug. The
 camera leg plugs a device and proves the handshake — negotiation, announcement, the host
 attaching the device channel — but feeds no sample: streaming needs an application on the host
 to open the camera, which is the half only a person can drive. The
