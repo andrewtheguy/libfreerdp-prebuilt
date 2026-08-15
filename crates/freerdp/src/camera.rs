@@ -155,11 +155,27 @@ impl Chan {
         // SAFETY: the caller holds the state lock, so the channel is alive (see `Chan`), and
         // `Write` copies the buffer before returning — FreeRDP's own ecam reuses its response
         // buffer immediately after this call.
-        unsafe {
+        let ok = unsafe {
             let Some(write) = (*self.0).Write else { return false };
             write(self.0, buf.len() as sys::ULONG, buf.as_ptr(), std::ptr::null_mut())
                 == sys::CHANNEL_RC_OK
-        }
+        };
+        trace(&format!(
+            "sent 0x{:02x}, {} byte(s), accepted={ok}",
+            buf.get(1).copied().unwrap_or(0),
+            buf.len()
+        ));
+        ok
+    }
+}
+
+/// Wire tracing for debugging against a real server: `FREERDP_ECAM_TRACE=1` prints every
+/// MS-RDPECAM message either way on stderr. The protocol has no observable state on the far
+/// side — a server that dislikes a response simply stops asking — so which request came last
+/// is the whole diagnosis, and this is how it is read.
+fn trace(line: &str) {
+    if std::env::var_os("FREERDP_ECAM_TRACE").is_some() {
+        eprintln!("ecam: {line}");
     }
 }
 
@@ -969,6 +985,11 @@ unsafe extern "C" fn on_data_received(
             return sys::CHANNEL_RC_OK;
         }
         let (server_version, id, body) = (bytes[0], bytes[1], &bytes[2..]);
+        trace(&format!(
+            "recv 0x{id:02x} on the {} channel, {} body byte(s)",
+            if enumerator { "enumerator" } else { "device" },
+            body.len()
+        ));
         if enumerator {
             handle_enumerator(shared, &channel, server_version, id);
         } else {
