@@ -725,26 +725,32 @@ unsafe extern "C" fn plugin_initialize(
         // Both listeners up front. The device listener could wait for the DeviceAdded that
         // names it, but a listener with no channel costs nothing and a race with the server's
         // create costs the device — the server may create the moment the notification lands.
-        let (enum_cb, enum_listener) =
-            // SAFETY: `mgr` is drdynvc's, live for the call; `shared_ptr` is the plugin's.
-            match unsafe { create_listener(mgr, shared_ptr, ENUMERATOR_CHANNEL, true) } {
-                Ok(pair) => pair,
-                Err(rc) => return rc,
-            };
-        // SAFETY: as above.
-        let (dev_cb, dev_listener) =
-            match unsafe { create_listener(mgr, shared_ptr, DEVICE_CHANNEL, false) } {
-                Ok(pair) => pair,
-                Err(rc) => return rc,
-            };
-        // SAFETY: `plugin` is live, single-threaded here — drdynvc initialises plugins before
-        // any channel traffic.
+        //
+        // Each listener is stored on the plugin the moment it exists, *before* the next one
+        // is attempted, so a failure partway through leaves everything already created where
+        // `plugin_terminated` reclaims it — dvcman calls Terminated on a plugin whose
+        // Initialize failed, so nothing is orphaned. Storing after both (the obvious shape)
+        // was a leak: the first listener's box would be unreachable when the second refused.
+        //
+        // SAFETY: `plugin` is live and single-threaded here — drdynvc initialises plugins
+        // before any channel traffic; `mgr` is drdynvc's, live for the call; `shared_ptr`
+        // is the plugin's.
         unsafe {
             (*plugin).mgr = mgr;
-            (*plugin).enum_listener_cb = enum_cb;
-            (*plugin).dev_listener_cb = dev_cb;
-            (*plugin).enum_listener = enum_listener;
-            (*plugin).dev_listener = dev_listener;
+            match create_listener(mgr, shared_ptr, ENUMERATOR_CHANNEL, true) {
+                Ok((cb, listener)) => {
+                    (*plugin).enum_listener_cb = cb;
+                    (*plugin).enum_listener = listener;
+                }
+                Err(rc) => return rc,
+            }
+            match create_listener(mgr, shared_ptr, DEVICE_CHANNEL, false) {
+                Ok((cb, listener)) => {
+                    (*plugin).dev_listener_cb = cb;
+                    (*plugin).dev_listener = listener;
+                }
+                Err(rc) => return rc,
+            }
         }
         sys::CHANNEL_RC_OK
     })
