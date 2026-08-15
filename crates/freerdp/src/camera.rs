@@ -113,9 +113,10 @@ pub struct CameraFormat {
 
 /// Where the host's streaming decisions go.
 ///
-/// **Every method runs on a FreeRDP thread**, under the camera's own lock, and must not block
-/// and must not call back into [`Camera`] — a queue whose push cannot wait is the shape this is
-/// for, exactly as with [`AudioSink`](crate::AudioSink).
+/// **Every method runs on a FreeRDP thread** and must not block and must not call back into
+/// [`Camera`] — the events are emitted with the camera's own lock released, but the thread they
+/// run on is the channel's, so a queue whose push cannot wait is the shape this is for, exactly
+/// as with [`AudioSink`](crate::AudioSink).
 pub trait CameraEvents: Send + Sync {
     /// The host opened the enumeration channel and a version was agreed: camera redirection is
     /// on offer at all. A host that never fires this has the channel disabled — policy, an old
@@ -318,11 +319,20 @@ impl Camera {
             st.awaiting_keyframe = false;
         }
         if st.credits > 0 && st.pending.is_empty() {
-            st.credits -= 1;
             let version = st.version;
-            if let Some(ch) = &st.device {
-                ch.write(&wire::sample_response(version, 0, data));
+            // The credit is spent only by a write the channel took: a refused
+            // write is the close the caller is about to observe, and burning
+            // the credit on it would leave one fewer for a stream that then
+            // survives. Refused rather than queued for the same reason — the
+            // queue is for samples a live channel will drain.
+            let sent = st
+                .device
+                .as_ref()
+                .is_some_and(|ch| ch.write(&wire::sample_response(version, 0, data)));
+            if !sent {
+                return false;
             }
+            st.credits -= 1;
             return true;
         }
         if st.pending.len() < PENDING_SAMPLES_MAX {
@@ -974,7 +984,10 @@ fn handle_enumerator(shared: &CamShared, channel: &Chan, server_version: u8, id:
     let mut st = shared.lock();
     match id {
         msg::SELECT_VERSION_RESPONSE => {
-            if server_version <= ECAM_PROTO_VERSION {
+            // Versions start at 1, so 0 is a malformed response rather than a
+            // negotiable floor; above our own is the server's choice we cannot
+            // speak. Either way the default stands and enumeration proceeds.
+            if (1..=ECAM_PROTO_VERSION).contains(&server_version) {
                 st.version = server_version;
             }
             st.enum_ready = true;
@@ -991,6 +1004,9 @@ fn handle_enumerator(shared: &CamShared, channel: &Chan, server_version: u8, id:
             drop(st);
             shared.events.negotiated(version);
         }
+        // A response is never answered: replying to a reply is how two ends
+        // volley errors at each other forever.
+        msg::SUCCESS_RESPONSE | msg::ERROR_RESPONSE => {}
         _ => {
             let version = st.version;
             channel.write(&wire::error_response(version, err::OPERATION_NOT_SUPPORTED));
@@ -1081,6 +1097,9 @@ fn handle_device(shared: &CamShared, channel: &Chan, id: u8, body: &[u8]) {
         msg::PROPERTY_LIST_REQUEST => {
             channel.write(&wire::property_list_response(version));
         }
+        // A response is never answered — the enumerator's rule, for the same
+        // reason: replying to a reply is a volley with no last word.
+        msg::SUCCESS_RESPONSE | msg::ERROR_RESPONSE => {}
         _ => {
             channel.write(&wire::error_response(version, err::OPERATION_NOT_SUPPORTED));
         }
