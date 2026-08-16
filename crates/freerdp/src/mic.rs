@@ -38,7 +38,8 @@ use std::sync::{Arc, Mutex};
 /// The MS-RDPEAI version this endpoint advertises — its own maximum, exactly as FreeRDP's audin
 /// client does. The client answers a server VERSION with *this* number (not the server's), and
 /// declines to answer only when the server asks for something newer than this. The negotiated value
-/// is otherwise unused on the wire, so it is recorded for tracing and nothing more.
+/// is otherwise unused on the wire, so nothing stores it — the reply and the `negotiated` event both
+/// carry this constant.
 const SNDIN_VERSION: u32 = 2;
 
 /// The audio-input channel's name — fixed by the protocol, `AUDIN_DVC_CHANNEL_NAME`.
@@ -79,6 +80,11 @@ mod msg {
 /// `S_OK` — the OpenReply result for an OPEN this endpoint accepted.
 const RESULT_OK: u32 = 0;
 
+/// `E_FAIL` — the OpenReply result for an OPEN this endpoint cannot honour (an index into a format
+/// it never advertised). Any failure HRESULT tells the host the stream did not open; a reply is what
+/// matters, so the host is not left waiting on one.
+const RESULT_FAIL: u32 = 0x8000_4005;
+
 /// A PCM capture format: what the host asked the microphone to produce.
 ///
 /// Always linear PCM at [`PCM_BITS_PER_SAMPLE`]; only the channel count and sample rate vary, and
@@ -92,14 +98,17 @@ pub struct MicFormat {
 }
 
 impl MicFormat {
-    /// Bytes in one sample across every channel — MS-RDPEAI's `nBlockAlign`.
+    /// Bytes in one sample across every channel — MS-RDPEAI's `nBlockAlign`. Saturating, because
+    /// `channels` is the host's untrusted number: an absurd count must not overflow the `u16` field
+    /// (a panic on the channel thread in debug, a wrapped value in release) on its way to the wire.
     fn block_align(self) -> u16 {
-        self.channels * (self.bits_per_sample / 8)
+        self.channels.saturating_mul(self.bits_per_sample / 8)
     }
 
-    /// Bytes a second of this occupies — `nAvgBytesPerSec`.
+    /// Bytes a second of this occupies — `nAvgBytesPerSec`. Saturating for the same reason, against a
+    /// host `sample_rate` large enough to overflow the `u32` field.
     fn byte_rate(self) -> u32 {
-        self.sample_rate * self.block_align() as u32
+        self.sample_rate.saturating_mul(self.block_align() as u32)
     }
 }
 
@@ -144,27 +153,36 @@ impl Chan {
             write(self.0, buf.len() as sys::ULONG, buf.as_ptr(), std::ptr::null_mut())
                 == sys::CHANNEL_RC_OK
         };
-        trace(&format!(
-            "sent 0x{:02x}, {} byte(s), accepted={ok}",
-            buf.first().copied().unwrap_or(0),
-            buf.len()
-        ));
+        // `write` runs per captured buffer, so build the trace string only when tracing is on —
+        // otherwise this allocates a formatted line for every buffer and throws it away.
+        if trace_enabled() {
+            trace(&format!(
+                "sent 0x{:02x}, {} byte(s), accepted={ok}",
+                buf.first().copied().unwrap_or(0),
+                buf.len()
+            ));
+        }
         ok
     }
+}
+
+/// Whether `FREERDP_AUDIN_TRACE` was set, read once. Caching it lets the per-buffer write path skip
+/// building a trace string when tracing is off without an env lookup each time.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FREERDP_AUDIN_TRACE").is_some())
 }
 
 /// Wire tracing for debugging against a real server: `FREERDP_AUDIN_TRACE=1` prints every
 /// MS-RDPEAI message either way on stderr — the same lever `FREERDP_ECAM_TRACE` is for the camera.
 fn trace(line: &str) {
-    if std::env::var_os("FREERDP_AUDIN_TRACE").is_some() {
+    if trace_enabled() {
         eprintln!("audin: {line}");
     }
 }
 
 /// Everything the protocol remembers, under the one lock.
 struct MicState {
-    /// The negotiated protocol version, agreed on the server's VERSION.
-    version: u32,
     /// The channel, present between its OnOpen and its OnClose.
     channel: Option<Chan>,
     /// The PCM formats this endpoint advertised, in the order it advertised them — an OPEN or a
@@ -176,7 +194,7 @@ struct MicState {
 
 impl MicState {
     fn new() -> Self {
-        Self { version: SNDIN_VERSION, channel: None, formats: Vec::new(), open: None }
+        Self { channel: None, formats: Vec::new(), open: None }
     }
 
     /// Stop streaming. Returns whether a stream was running, which is whether anyone needs telling.
@@ -469,6 +487,24 @@ mod wire {
             body.extend_from_slice(&extensible(&STEREO_44K, true));
             body.extend_from_slice(&extensible(&MONO_16K, false)); // non-PCM subtype
             assert_eq!(parse_formats(&body), vec![STEREO_44K]);
+        }
+
+        /// A record claiming `cbSize = 22` but truncated before its SubFormat GUID must be skipped,
+        /// not read out of bounds: `parse_formats` guards the GUID read with `at + 26 <= body.len()`.
+        #[test]
+        fn parse_formats_skips_a_truncated_extensible_record() {
+            // The 18-byte base tagged EXTENSIBLE with cbSize=22, then only the 6 bytes of valid-bits
+            // and channel-mask — the buffer ends before the GUID at record+24 would begin.
+            let mut rec = audio_format(&STEREO_44K).to_vec();
+            rec[0..2].copy_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
+            rec[16..18].copy_from_slice(&22u16.to_le_bytes()); // cbSize claims 22 bytes follow
+            rec.extend_from_slice(&16u16.to_le_bytes()); // wValidBitsPerSample
+            rec.extend_from_slice(&3u32.to_le_bytes()); // dwChannelMask — GUID would start here
+            let mut body = Vec::new();
+            body.extend_from_slice(&1u32.to_le_bytes()); // NumFormats
+            body.extend_from_slice(&0u32.to_le_bytes()); // cbSizeFormatsPacket (untrusted)
+            body.extend_from_slice(&rec);
+            assert!(parse_formats(&body).is_empty());
         }
 
         #[test]
@@ -832,12 +868,12 @@ fn handle(shared: &MicShared, channel: &Chan, id: u8, body: &[u8]) {
             if let Some(server) = wire::parse_version(body) {
                 // Answer the server's VERSION with our own maximum, exactly as FreeRDP's audin
                 // client does — never the server's number — and decline (no reply) only when the
-                // server asks for a version newer than we speak. The agreed value is recorded for
-                // tracing; it drives nothing on the wire.
+                // server asks for a version newer than we speak. The negotiated value drives nothing
+                // on the wire, so nothing remembers it; the reply and the event both carry the one
+                // number this endpoint speaks.
                 if server > SNDIN_VERSION {
                     trace(&format!("host VERSION {server} is newer than {SNDIN_VERSION}; not answering"));
                 } else {
-                    st.version = server;
                     channel.write(&wire::version(SNDIN_VERSION));
                     event = Some(MicEvent::Negotiated(SNDIN_VERSION));
                 }
@@ -873,7 +909,11 @@ fn handle(shared: &MicShared, channel: &Chan, id: u8, body: &[u8]) {
                     channel.write(&wire::open_reply(RESULT_OK));
                     event = Some(MicEvent::Opened(format));
                 } else {
-                    trace(&format!("OPEN names unadvertised format index {index}; ignoring"));
+                    // An index into a list we never advertised: acknowledge the OPEN with a failure
+                    // rather than silence, so every parsed OPEN gets a reply. The unadvertised format
+                    // is otherwise ignored — no FormatChange, no open, no event.
+                    trace(&format!("OPEN names unadvertised format index {index}; declining"));
+                    channel.write(&wire::open_reply(RESULT_FAIL));
                 }
             }
         }
