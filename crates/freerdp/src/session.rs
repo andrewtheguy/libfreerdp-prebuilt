@@ -17,6 +17,7 @@
 use freerdp_sys as sys;
 
 use crate::audio::{self, Audio};
+use crate::camera::Camera;
 use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
 use crate::error::Error;
 use crate::framebuffer::{Framebuffer, Rect};
@@ -99,6 +100,16 @@ pub struct Connect {
     /// off the back of a queue of paint rectangles — see [`AudioSink`](crate::AudioSink), which
     /// also says what a sink may not do on that thread.
     pub audio: Option<Audio>,
+    /// Whether to speak MS-RDPECAM and where the host's streaming decisions go. `None` offers
+    /// the server no camera redirection at all, which is the default.
+    ///
+    /// Like sound, the camera does **not** go through [`Event`]: the host's start/stop/credit
+    /// decisions land on [`CameraEvents`](crate::CameraEvents) on a FreeRDP thread, and the
+    /// embedder's encoded frames go in through [`Camera`](crate::Camera) from any thread. The
+    /// device itself appears and disappears by [`Camera::plug`](crate::Camera::plug) and
+    /// [`Camera::unplug`](crate::Camera::unplug), not by connecting: a session can run for hours
+    /// before the embedder first has frames to offer.
+    pub camera: Option<Camera>,
     /// Whether to load `disp` and advertise DisplayControl, which is what makes
     /// [`Input::resize`](crate::Input::resize) do anything.
     ///
@@ -146,6 +157,7 @@ impl Default for Connect {
             security: Security::default(),
             clipboard: true,
             audio: None,
+            camera: None,
             resize: false,
             egfx: true,
             connect_timeout: Duration::from_secs(15),
@@ -467,6 +479,10 @@ pub(crate) struct Bridge {
     /// Where redirected sound goes, and `None` on a session that asked for none — in which case
     /// `rdpsnd` was never registered and nothing in `audio.rs` can be reached at all.
     pub(crate) audio: Option<Audio>,
+    /// The session's camera, and `None` on a session that configured none — in which case
+    /// `rdpecam` was never registered and nothing in `camera.rs` can be reached at all. What
+    /// the DVC plugin entry recovers through `GetRdpContext`.
+    pub(crate) camera: Option<Camera>,
     /// Which `rdpsnd` device is playing. See `audio::open`: the channel is registered twice, as a
     /// static channel and a dynamic one, and only one of them may fill the sink.
     pub(crate) audio_device: *mut sys::rdpsndDevicePlugin,
@@ -584,6 +600,7 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         events: events.clone(),
         shared: Arc::clone(shared),
         audio: config.audio.clone(),
+        camera: config.camera.clone(),
         audio_device: std::ptr::null_mut(),
         cliprdr: std::ptr::null_mut(),
         clipboard_ready: false,
@@ -654,12 +671,12 @@ fn run_connected(
     apply_settings(config, ctx)?;
     subscribe_channels(ctx)?;
 
-    // As late as possible, and only when there is sound to carry. FreeRDP's addin provider is a
-    // process global that `freerdp_client_context_new` overwrites, so the window in which another
-    // session could take it back is the gap between here and `freerdp_connect` loading the
-    // channels — narrow rather than closed, and `audio::install_provider` says why it cannot be
-    // closed at all.
-    if config.audio.is_some() {
+    // As late as possible, and only when there is sound or a camera to carry. FreeRDP's addin
+    // provider is a process global that `freerdp_client_context_new` overwrites, so the window
+    // in which another session could take it back is the gap between here and `freerdp_connect`
+    // loading the channels — narrow rather than closed, and `audio::install_provider` says why
+    // it cannot be closed at all. One provider answers for both channels; see `addin_provider`.
+    if config.audio.is_some() || config.camera.is_some() {
         audio::install_provider()?;
     }
 
@@ -966,6 +983,9 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
     if config.audio.is_some() {
         register_audio_channels(settings)?;
     }
+    if config.camera.is_some() {
+        register_camera_channel(settings)?;
+    }
     Ok(())
 }
 
@@ -994,6 +1014,28 @@ fn register_audio_channels(settings: *mut sys::rdpSettings) -> Result<(), Error>
     };
     if added.0 == 0 || added.1 == 0 {
         return Err(Error::local("FreeRDP refused the rdpsnd channel"));
+    }
+    Ok(())
+}
+
+/// Register `rdpecam` as a dynamic channel, which is what makes drdynvc ask the addin provider
+/// for it — the provider answers with this crate's own plugin (see `audio.rs`).
+///
+/// Dynamic only, because that is all MS-RDPECAM is: unlike sound there is no static transport
+/// for a server to prefer, and no subsystem argument to smuggle in — the plugin needs none,
+/// since it finds its session through `GetRdpContext`. There is also no settings key doing this
+/// implicitly, the way `FreeRDP_AudioPlayback` maps to `rdpsnd`: the archives compile the
+/// channel out (see build.sh), so its settings entry does not exist and the by-hand
+/// registration below is the only road in.
+fn register_camera_channel(settings: *mut sys::rdpSettings) -> Result<(), Error> {
+    let name = CString::new("rdpecam").expect("a literal with no NUL");
+    let params: [*const c_char; 1] = [name.as_ptr()];
+
+    // SAFETY: `settings` is live, `params` outlives the call, and it copies what it needs.
+    if unsafe { sys::freerdp_client_add_dynamic_channel(settings, params.len(), params.as_ptr()) }
+        == 0
+    {
+        return Err(Error::local("FreeRDP refused the rdpecam channel"));
     }
     Ok(())
 }

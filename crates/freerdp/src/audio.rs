@@ -158,9 +158,10 @@ const _: () = {
 /// delegation below call itself for ever.
 static UPSTREAM: OnceLock<sys::FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN> = OnceLock::new();
 
-/// Chain this crate's addin provider in front of FreeRDP's, so `sys:rust` resolves.
+/// Chain this crate's addin provider in front of FreeRDP's, so `sys:rust` — and the `rdpecam`
+/// plugin, which the same provider answers for — resolves.
 ///
-/// Called once per session that wants sound, as late as possible — the channels are loaded during
+/// Called once per session that wants sound or a camera, as late as possible — the channels are loaded during
 /// `freerdp_connect`, and the provider is a **process global**. That global is the one thing here
 /// this crate cannot make per-session: a second `freerdp_client_context_new` overwrites it, so
 /// starting another session while this one is still inside `freerdp_connect` can cost this one
@@ -179,7 +180,13 @@ pub(crate) fn install_provider() -> Result<(), Error> {
     Ok(())
 }
 
-/// Answer for `rdpsnd`'s `rust` subsystem; delegate everything else unchanged.
+/// Answer for `rdpsnd`'s `rust` subsystem and for the `rdpecam` DVC plugin; delegate everything
+/// else unchanged.
+///
+/// One provider for both rather than one each, and not for tidiness: each installation captures
+/// whatever provider is current as its upstream, so two of them chained in whichever order
+/// sessions happened to configure sound and camera would leave the later `install_provider`
+/// unhooking the earlier one's answers. A single function has no order to get wrong.
 unsafe extern "C" fn addin_provider(
     name: sys::LPCSTR,
     subsystem: sys::LPCSTR,
@@ -191,6 +198,24 @@ unsafe extern "C" fn addin_provider(
         let named = |ptr: sys::LPCSTR, want: &CStr| {
             !ptr.is_null() && unsafe { CStr::from_ptr(ptr) } == want
         };
+        // The camera plugin: drdynvc resolves each configured dynamic channel by bare name
+        // (`freerdp_load_channel_addin_entry(name, NULL, NULL, …)` in `drdynvc_load_addin`),
+        // and the archives compile no `rdpecam` of their own for this to shadow.
+        if named(name, c"rdpecam") && subsystem.is_null() {
+            // The DVC entry has its own signature — `PDVC_PLUGIN_ENTRY` — and the provider
+            // returns the generic channel one, so drdynvc casts it back before calling
+            // (`WINPR_FUNC_PTR_CAST` in `drdynvc_load_addin`, from the other side).
+            //
+            // SAFETY: sound only because the pair is chosen together, exactly as for rdpsnd
+            // below: drdynvc casts whatever it gets for this name to `PDVC_PLUGIN_ENTRY`, and
+            // `camera::plugin_entry` is declared with exactly that signature.
+            return Some(unsafe {
+                std::mem::transmute::<
+                    unsafe extern "C" fn(*mut sys::IDRDYNVC_ENTRY_POINTS) -> sys::UINT,
+                    unsafe extern "C" fn(sys::PCHANNEL_ENTRY_POINTS) -> sys::BOOL,
+                >(crate::camera::plugin_entry)
+            });
+        }
         if named(name, c"rdpsnd") && named(subsystem, SUBSYSTEM) {
             // The device entry has its own signature — `PFREERDP_RDPSND_DEVICE_ENTRY` — and the
             // provider returns the generic channel one, so rdpsnd casts it back before calling.

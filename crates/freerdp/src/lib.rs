@@ -84,6 +84,7 @@
 //! own process; that is a decision for the embedder, and this crate cannot make it.
 
 mod audio;
+mod camera;
 mod clipboard;
 mod error;
 mod framebuffer;
@@ -92,6 +93,7 @@ mod pointer;
 mod session;
 
 pub use audio::{Audio, AudioFormat, AudioSink};
+pub use camera::{Camera, CameraEvents, CameraFormat};
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardFormat};
 pub use error::Error;
 pub use framebuffer::{Frame, Framebuffer, Rect};
