@@ -180,8 +180,8 @@ pub(crate) fn install_provider() -> Result<(), Error> {
     Ok(())
 }
 
-/// Answer for `rdpsnd`'s `rust` subsystem and for the `rdpecam` DVC plugin; delegate everything
-/// else unchanged.
+/// Answer for `rdpsnd`'s `rust` subsystem and for the `rdpecam` and `audin` DVC plugins; delegate
+/// everything else unchanged.
 ///
 /// One provider for both rather than one each, and not for tidiness: each installation captures
 /// whatever provider is current as its upstream, so two of them chained in whichever order
@@ -214,6 +214,20 @@ unsafe extern "C" fn addin_provider(
                     unsafe extern "C" fn(*mut sys::IDRDYNVC_ENTRY_POINTS) -> sys::UINT,
                     unsafe extern "C" fn(sys::PCHANNEL_ENTRY_POINTS) -> sys::BOOL,
                 >(crate::camera::plugin_entry)
+            });
+        }
+        // The microphone plugin, resolved exactly like the camera's: the archives compile no
+        // `audin` of their own for this to shadow, and drdynvc resolves the configured dynamic
+        // channel by bare name.
+        if named(name, c"audin") && subsystem.is_null() {
+            // SAFETY: sound only because the pair is chosen together, exactly as for rdpecam and
+            // rdpsnd: drdynvc casts whatever it gets for this name to `PDVC_PLUGIN_ENTRY`, and
+            // `mic::plugin_entry` is declared with exactly that signature.
+            return Some(unsafe {
+                std::mem::transmute::<
+                    unsafe extern "C" fn(*mut sys::IDRDYNVC_ENTRY_POINTS) -> sys::UINT,
+                    unsafe extern "C" fn(sys::PCHANNEL_ENTRY_POINTS) -> sys::BOOL,
+                >(crate::mic::plugin_entry)
             });
         }
         if named(name, c"rdpsnd") && named(subsystem, SUBSYSTEM) {
