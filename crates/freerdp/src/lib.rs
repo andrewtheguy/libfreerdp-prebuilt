@@ -57,9 +57,11 @@
 //!
 //! # What this does not do
 //!
-//! - **No microphone.** `rdpsnd` carries the remote's sound *out*; `audin` would carry a local
-//!   one in, and it is not built into the archives. A headless gateway has no microphone anyway —
-//!   whatever it forwarded would be somebody else's, over a link.
+//! - **Microphone in, browser-fed.** `rdpsnd` carries the remote's sound *out*; [`Microphone`]
+//!   carries one *in*, over MS-RDPEAI's `AUDIO_INPUT` channel. FreeRDP's own `audin` is a local
+//!   capture stack and is compiled out; this crate implements the endpoint itself, exactly as it
+//!   does the camera, because a headless gateway's "microphone" is a browser's, arriving as PCM
+//!   over a socket rather than from any sound card here.
 //! - **No graphics pipeline.** `FreeRDP_SupportGraphicsPipeline` is set to `FALSE`, deliberately
 //!   and with a measurement behind it — see [`Connect`].
 //! - **No certificate verification.** Also deliberate, also documented on [`Connect`]. Read that
@@ -89,11 +91,13 @@ mod clipboard;
 mod error;
 mod framebuffer;
 mod input;
+mod mic;
 mod pointer;
 mod session;
 
 pub use audio::{Audio, AudioFormat, AudioSink};
 pub use camera::{Camera, CameraEvents, CameraFormat};
+pub use mic::{MicEvents, MicFormat, Microphone};
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardFormat};
 pub use error::Error;
 pub use framebuffer::{Frame, Framebuffer, Rect};

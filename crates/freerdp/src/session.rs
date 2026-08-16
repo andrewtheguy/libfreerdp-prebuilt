@@ -19,6 +19,7 @@ use freerdp_sys as sys;
 use crate::audio::{self, Audio};
 use crate::camera::Camera;
 use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
+use crate::mic::Microphone;
 use crate::error::Error;
 use crate::framebuffer::{Framebuffer, Rect};
 use crate::input::{Command, Input};
@@ -110,6 +111,16 @@ pub struct Connect {
     /// [`Camera::unplug`](crate::Camera::unplug), not by connecting: a session can run for hours
     /// before the embedder first has frames to offer.
     pub camera: Option<Camera>,
+    /// Whether to speak MS-RDPEAI and where the host's microphone decisions go. `None` offers the
+    /// server no microphone at all, which is the default.
+    ///
+    /// The camera's twin, in every way that matters: the media goes browser to host, the host's
+    /// open/close decisions land on [`MicEvents`](crate::MicEvents) on a FreeRDP thread, and the
+    /// embedder's PCM goes in through [`Microphone`](crate::Microphone) from any thread. Unlike the
+    /// camera there is no device to plug — MS-RDPEAI has no device layer — so the microphone is
+    /// present for as long as the channel is registered, and whether real audio flows is simply
+    /// whether the embedder is feeding it.
+    pub microphone: Option<Microphone>,
     /// Whether to load `disp` and advertise DisplayControl, which is what makes
     /// [`Input::resize`](crate::Input::resize) do anything.
     ///
@@ -158,6 +169,7 @@ impl Default for Connect {
             clipboard: true,
             audio: None,
             camera: None,
+            microphone: None,
             resize: false,
             egfx: true,
             connect_timeout: Duration::from_secs(15),
@@ -483,6 +495,10 @@ pub(crate) struct Bridge {
     /// `rdpecam` was never registered and nothing in `camera.rs` can be reached at all. What
     /// the DVC plugin entry recovers through `GetRdpContext`.
     pub(crate) camera: Option<Camera>,
+    /// The session's microphone, and `None` on a session that configured none — in which case
+    /// `audin` was never registered and nothing in `mic.rs` can be reached at all. What the DVC
+    /// plugin entry recovers through `GetRdpContext`, exactly as for the camera.
+    pub(crate) microphone: Option<Microphone>,
     /// Which `rdpsnd` device is playing. See `audio::open`: the channel is registered twice, as a
     /// static channel and a dynamic one, and only one of them may fill the sink.
     pub(crate) audio_device: *mut sys::rdpsndDevicePlugin,
@@ -601,6 +617,7 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         shared: Arc::clone(shared),
         audio: config.audio.clone(),
         camera: config.camera.clone(),
+        microphone: config.microphone.clone(),
         audio_device: std::ptr::null_mut(),
         cliprdr: std::ptr::null_mut(),
         clipboard_ready: false,
@@ -676,7 +693,7 @@ fn run_connected(
     // in which another session could take it back is the gap between here and `freerdp_connect`
     // loading the channels — narrow rather than closed, and `audio::install_provider` says why
     // it cannot be closed at all. One provider answers for both channels; see `addin_provider`.
-    if config.audio.is_some() || config.camera.is_some() {
+    if config.audio.is_some() || config.camera.is_some() || config.microphone.is_some() {
         audio::install_provider()?;
     }
 
@@ -836,6 +853,12 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // sufficient on its own, because a channel with no `sys:` argument picks its own backend
         // and this build's list ends in `fake`. `register_audio_channels` below puts the name in.
         (B::FreeRDP_AudioPlayback, config.audio.is_some()),
+        // Microphone. Unlike `rdpecam`, registering the `audin` channel is not
+        // enough: a server opens AUDIO_INPUT only for a client that advertises
+        // audio-capture support in its info PDU, which is this capability bit.
+        // Without it Windows joins the channel but never negotiates, so the
+        // microphone never appears on the host. See `register_mic_channel`.
+        (B::FreeRDP_AudioCapture, config.microphone.is_some()),
         // Software GDI: FreeRDP decodes into `gdi->primary_buffer` rather than into a hardware
         // surface. That *is* the headless path — `gdi_init` below has nothing to draw on
         // otherwise — and it is what makes `EndPaint` mean "these pixels are ready".
@@ -986,6 +1009,9 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
     if config.camera.is_some() {
         register_camera_channel(settings)?;
     }
+    if config.microphone.is_some() {
+        register_mic_channel(settings)?;
+    }
     Ok(())
 }
 
@@ -1036,6 +1062,27 @@ fn register_camera_channel(settings: *mut sys::rdpSettings) -> Result<(), Error>
         == 0
     {
         return Err(Error::local("FreeRDP refused the rdpecam channel"));
+    }
+    Ok(())
+}
+
+/// Register `audin` as a dynamic channel, which is what makes drdynvc ask the addin provider for it
+/// — the provider answers with this crate's own MS-RDPEAI plugin (see `audio.rs` and `mic.rs`).
+///
+/// Dynamic only and by hand, for exactly the reasons `register_camera_channel` is: MS-RDPEAI has no
+/// static transport, the plugin needs no subsystem argument (it finds its session through
+/// `GetRdpContext`), and the archives compile the channel out, so no settings key registers it
+/// implicitly. The name is `audin` — the addin drdynvc loads — while the listener the plugin
+/// creates is the protocol's fixed `AUDIO_INPUT`.
+fn register_mic_channel(settings: *mut sys::rdpSettings) -> Result<(), Error> {
+    let name = CString::new("audin").expect("a literal with no NUL");
+    let params: [*const c_char; 1] = [name.as_ptr()];
+
+    // SAFETY: `settings` is live, `params` outlives the call, and it copies what it needs.
+    if unsafe { sys::freerdp_client_add_dynamic_channel(settings, params.len(), params.as_ptr()) }
+        == 0
+    {
+        return Err(Error::local("FreeRDP refused the audin channel"));
     }
     Ok(())
 }
