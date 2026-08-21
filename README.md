@@ -116,8 +116,8 @@ the two files differ in 626 lines.
 
 ## The wrapper
 
-`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse, clipboard, resize and
-sound.
+`crates/freerdp` is a headless RDP client: screen, cursor, keyboard, mouse, touch, clipboard,
+resize and sound.
 
 ```rust
 let (session, events) = Session::start(Connect { host, username, password, ..Default::default() });
