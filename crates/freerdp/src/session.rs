@@ -22,7 +22,7 @@ use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
 use crate::mic::Microphone;
 use crate::error::Error;
 use crate::framebuffer::{Framebuffer, Rect};
-use crate::input::{Command, Input};
+use crate::input::{Command, Input, TouchPhase};
 use crate::pointer::{self, Cursor};
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CString};
@@ -151,6 +151,21 @@ pub struct Connect {
     /// them, and still surfaces as the one [`Event::Resize`]. See `resize` in this module for
     /// the measurements.
     pub egfx: bool,
+    /// Whether to load `rdpei` and advertise multitouch, which is what makes
+    /// [`Input::touch`](crate::Input::touch) do anything.
+    ///
+    /// MS-RDPEI is the channel a Windows host takes *touch contacts* on — the one its own
+    /// client uses from a tablet — and a contact injected there is a real touch pointer to the
+    /// host: the shell's edge swipes, pinch, press-and-hold and multi-finger gestures are all the
+    /// host's own doing, with nothing emulated on this side. Which is also why it is a separate
+    /// switch from the mouse: a session that only ever has a mouse has no reason to announce a
+    /// digitizer it does not have.
+    ///
+    /// Off by default. A host that supports it opens the channel shortly after connecting, which
+    /// arrives as [`Event::TouchReady`]; one that does not (xrdp, and every VNC-era host) never
+    /// opens it, and contacts sent anyway are dropped — like every other input on a session that
+    /// cannot carry it.
+    pub touch: bool,
     pub connect_timeout: Duration,
     pub keepalive: KeepAlive,
 }
@@ -172,6 +187,7 @@ impl Default for Connect {
             microphone: None,
             resize: false,
             egfx: true,
+            touch: false,
             connect_timeout: Duration::from_secs(15),
             keepalive: KeepAlive::default(),
         }
@@ -221,6 +237,15 @@ pub enum Event {
     /// `max_area` is the largest total monitor area the server will accept, in pixels; this crate
     /// asks for one monitor, so it bounds `width * height`.
     ResizeReady { max_monitors: u32, max_area: u64 },
+    /// The server opened the touch channel, so [`Input::touch`](crate::Input::touch) now has
+    /// somewhere to go. Only ever sent on a session configured with [`Connect::touch`], and not
+    /// at all by a server that does not implement MS-RDPEI — which is the honest signal a consumer
+    /// needs before offering a touchscreen mode to a user.
+    ///
+    /// Unlike DisplayControl, the channel being open *is* the server's half: a dynamic channel is
+    /// created by the server (`drdynvc` fires ChannelConnected from the server's create request),
+    /// and a host that creates this one sends its `SC_READY` on it straight away.
+    TouchReady,
     Cursor(Cursor),
     Clipboard(ClipboardEvent),
     /// The session is over, and the channel is about to close. `Ok(())` is an orderly
@@ -511,6 +536,9 @@ pub(crate) struct Bridge {
     /// Whether the server's DisplayControl capabilities have arrived. Until they do, the channel
     /// exists but the server has not said it will listen.
     resize_ready: bool,
+    /// The touch channel, once the server has opened it, and null before and after. Null is
+    /// also what a contact is dropped on — see [`Input::touch`].
+    rdpei: *mut sys::RdpeiClientContext,
     /// The most recent size asked for before the channel was ready — only the most recent, since
     /// a resize supersedes every earlier one rather than queueing behind it.
     pending_resize: Option<(u32, u32, u32)>,
@@ -624,6 +652,7 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         pending_advertise: None,
         disp: std::ptr::null_mut(),
         resize_ready: false,
+        rdpei: std::ptr::null_mut(),
         pending_resize: None,
         audio_devices_seen: 0,
         audio_dynamic_negotiated: false,
@@ -895,6 +924,11 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // drive the resolution", and `xf_disp.c` is the only thing that reads it. A headless
         // client has no window, and resizes when its embedder says so.
         (B::FreeRDP_SupportDisplayControl, config.resize),
+        // Touch. The same shape as the line above: this key is both the capability and the
+        // channel switch, since the same addin table maps `FreeRDP_MultiTouchInput` to `rdpei`.
+        // Not paired with `FreeRDP_MultiTouchGestures`, which is xfreerdp's own *local* gesture
+        // recogniser (pinch-to-zoom the window) and nothing a headless client has a use for.
+        (B::FreeRDP_MultiTouchInput, config.touch),
         // Refresh and suppress-output are what make `Input::refresh` and a minimised viewer
         // work; both are cheap capability bits.
         (B::FreeRDP_RefreshRect, true),
@@ -1279,6 +1313,10 @@ unsafe fn execute(ctx: *mut sys::rdpContext, command: Command) {
             // SAFETY: as above.
             unsafe { resize(ctx, width, height, scale_percent) };
         }
+        Command::Touch { phase, id, x, y } => {
+            // SAFETY: as above.
+            unsafe { send_touch(ctx, phase, id, x, y) };
+        }
         Command::ClipboardAdvertise(formats) => {
             // SAFETY: as above.
             unsafe { clipboard_advertise(ctx, formats) };
@@ -1477,6 +1515,51 @@ unsafe fn request_resize(
     // SAFETY: `disp` was stored by `channel_connected` and cleared by `channel_disconnected`, so
     // a non-null one here is live.
     unsafe { send_monitor_layout(bridge.disp, width, height, scale_percent) };
+}
+
+/// Inject one touch contact transition, or drop it if the server never opened the channel.
+///
+/// The plugin keeps the contact table: `id` is the caller's *external* id and `rdpei` maps it to
+/// one of its ten `contactId` slots on `Down`, finds it again on `Move`/`Up`/`Cancel`, and frees
+/// it on `Up` and `Cancel` (`rdpei_contact` in `channels/rdpei/client/rdpei_main.c`). An `Up` is
+/// sent by the plugin as an in-contact update followed by the up, which is the transition
+/// MS-RDPEI 3.1.1.1 requires. The returned contact id is not wanted: the caller names contacts,
+/// and the plugin's numbering is the wire's business.
+///
+/// Not routed through `freerdp_client_handle_touch`, deliberately. That helper keeps a second
+/// contact table in `rdpClientContext` whose slots are only released by an *up* — a cancelled
+/// contact (3.22's `FREERDP_TOUCH_CANCEL`) stays in it under its id, so ten cancels with ten
+/// distinct ids fill the table for the rest of the session. Calling the plugin directly has one
+/// table, the plugin's, and it releases on both.
+///
+/// # Safety
+///
+/// `ctx` must be live and connected.
+unsafe fn send_touch(ctx: *mut sys::rdpContext, phase: TouchPhase, id: i32, x: i32, y: i32) {
+    // SAFETY: the caller guarantees the context.
+    let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
+    let rdpei = bridge.rdpei;
+    if rdpei.is_null() {
+        // Dropped rather than held, unlike a resize: a contact is a moment, and a finger that
+        // went down before the channel came up has no meaning by the time it would be sent.
+        return;
+    }
+    // SAFETY: `rdpei` was stored by `channel_connected` and cleared by `channel_disconnected`,
+    // so a non-null one here is live, and every entry point below is set by the plugin.
+    unsafe {
+        let call = match phase {
+            TouchPhase::Down => (*rdpei).TouchBegin,
+            TouchPhase::Move => (*rdpei).TouchUpdate,
+            TouchPhase::Up => (*rdpei).TouchEnd,
+            TouchPhase::Cancel => (*rdpei).TouchCancel,
+        };
+        let Some(call) = call else { return };
+        let mut contact_id: i32 = -1;
+        // A failure here is the channel's own — a frame that would not encode, a contact the
+        // plugin has no slot for — and the input path has nothing useful to do with it: the
+        // next contact is independent, and the session carries on. Same policy as the mouse.
+        let _ = call(rdpei, id, x, y, &mut contact_id);
+    }
 }
 
 /// Build a one-monitor layout and send it.
@@ -1961,15 +2044,16 @@ unsafe extern "C" fn pointer_set_position(
 
 /// The channel-connected handler, subscribed in `subscribe_channels`.
 ///
-/// Only `cliprdr` and `disp` are claimed here. Everything else falls through to
+/// Only `cliprdr`, `disp` and `rdpei` are claimed here. Everything else falls through to
 /// `freerdp_client_OnChannelConnectedEventHandler`, which is what binds `rdpgfx` to the GDI and
 /// wires up the channels this crate does not touch — so falling through is not "ignoring", it is
 /// letting FreeRDP's own client-common do the part it already does correctly.
 ///
-/// The two names are matched differently for a reason that is not a style: `cliprdr` is a static
-/// virtual channel and arrives under its 8-character SVC name, while `disp` is a *dynamic* one and
-/// arrives under the long `Microsoft::Windows::RDS::DisplayControl` its plugin registered
-/// (`channels/disp/client/disp_main.c`). Matching a DVC on its short name silently never fires.
+/// The names are matched differently for a reason that is not a style: `cliprdr` is a static
+/// virtual channel and arrives under its 8-character SVC name, while `disp` and `rdpei` are
+/// *dynamic* ones and arrive under the long `Microsoft::Windows::RDS::DisplayControl` and
+/// `Microsoft::Windows::RDS::Input` their plugins registered (`channels/disp/client/disp_main.c`,
+/// `channels/rdpei/client/rdpei_main.c`). Matching a DVC on its short name silently never fires.
 unsafe extern "C" fn channel_connected(
     context: *mut c_void,
     e: *const sys::ChannelConnectedEventArgs,
@@ -2008,6 +2092,18 @@ unsafe extern "C" fn channel_connected(
                 // No `resize_ready` here. The channel being open is this client's half; the
                 // server's half is the capabilities PDU, and a layout sent before it goes to a
                 // server that has not agreed to listen.
+            } else if name == sys::RDPEI_DVC_CHANNEL_NAME.as_slice() {
+                let rdpei = (*e).pInterface as *mut sys::RdpeiClientContext;
+                if rdpei.is_null() {
+                    return;
+                }
+                (*rdpei).custom = ctx as *mut c_void;
+                bridge_ref.rdpei = rdpei;
+                // Ready now, unlike `disp`: a dynamic channel's ChannelConnected is fired by
+                // `drdynvc` from the *server's* create request (`dvcman_create_channel`), so a
+                // server that opened this one has already said it takes touch, and its
+                // `SC_READY` follows on the same channel without anything to wait for.
+                bridge_ref.send(Event::TouchReady);
             } else {
                 sys::freerdp_client_OnChannelConnectedEventHandler(context, e);
             }
@@ -2018,8 +2114,9 @@ unsafe extern "C" fn channel_connected(
 /// The other half, and it exists to prevent a use-after-free rather than to tidy up.
 ///
 /// A channel can close while the session lives on — the peer drops it, or the plugin fails — and
-/// closing it frees the interface struct. Without this, `bridge.cliprdr` and `bridge.disp` would
-/// go on pointing at freed memory, and the next `advertise` or `resize` would write through it.
+/// closing it frees the interface struct. Without this, `bridge.cliprdr`, `bridge.disp` and
+/// `bridge.rdpei` would go on pointing at freed memory, and the next `advertise`, `resize` or
+/// `touch` would write through it.
 /// That is a use-after-free that would usually *work*, which is the worst kind.
 unsafe extern "C" fn channel_disconnected(
     context: *mut c_void,
@@ -2038,6 +2135,8 @@ unsafe extern "C" fn channel_disconnected(
             } else if name == sys::DISP_DVC_CHANNEL_NAME.as_slice() {
                 bridge_ref.disp = std::ptr::null_mut();
                 bridge_ref.resize_ready = false;
+            } else if name == sys::RDPEI_DVC_CHANNEL_NAME.as_slice() {
+                bridge_ref.rdpei = std::ptr::null_mut();
             } else {
                 sys::freerdp_client_OnChannelDisconnectedEventHandler(context, e);
             }
