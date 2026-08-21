@@ -28396,6 +28396,7 @@ pub type pcRdpeiSuspendTouch =
 pub type pcRdpeiResumeTouch =
     ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext) -> UINT>;
 #[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct s_rdpei_client_context {
     pub handle: *mut ::std::os::raw::c_void,
     pub custom: *mut ::std::os::raw::c_void,

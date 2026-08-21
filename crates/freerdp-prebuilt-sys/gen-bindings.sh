@@ -135,6 +135,12 @@ generate() {
   # keeps the constants-not-Rust-enums property that matters: these are still integers, so a key
   # a future FreeRDP adds cannot be undefined behaviour.
   #
+  # `--with-derive-custom-struct` on the rdpei context, because bindgen will not *infer* derives
+  # for a struct with a field of a blocklisted type — it cannot see what the raw-line stand-in
+  # for `pcRdpeiTouchRawEventVA` is — and so emitted this one context without the
+  # `Debug, Copy, Clone` every other channel context has. The stand-ins are `Option<fn>`s, which
+  # are all three, so the derives are asked for by name.
+  #
   # `--rust-target` pinned for the same reason the bindgen version is, and it is the one flag
   # that decides this crate's MSRV: bindgen defaults to the newest Rust it knows about, and from
   # 1.82 it emits `unsafe extern "C" { … }` blocks which do not parse on an older compiler.
@@ -157,6 +163,7 @@ generate() {
     --blocklist-type '(__builtin_|__gnuc_)?va_list' \
     --blocklist-type '__va_list_tag' \
     --blocklist-type 'pcRdpei(TouchRaw|PenRaw)EventVA' \
+    --with-derive-custom-struct 's_rdpei_client_context=Debug,Copy,Clone' \
     --blocklist-item '_M_[A-Z0-9_]*' \
     --blocklist-item 'MEMORY_ALLOCATION_ALIGNMENT' \
     --default-enum-style consts \

@@ -214,7 +214,9 @@ impl Input {
     /// Needs [`Connect::touch`](crate::Connect::touch) and a server that opens the touch channel —
     /// announced as [`Event::TouchReady`](crate::Event::TouchReady). Before that, and on a
     /// session that never gets the channel, the contact is **dropped**, not held: a finger is a
-    /// moment, and replaying one later would be a gesture nobody made.
+    /// moment, and replaying one later would be a gesture nobody made. Dropped too while the host
+    /// has *suspended* touch — see [`Event::TouchReady`](crate::Event::TouchReady) — and a
+    /// contact that was down when the host did so is cancelled on its behalf.
     ///
     /// `id` is the caller's name for the finger, and it is the only thing tying a `Down` to the
     /// `Move`s, and the `Up` or `Cancel`, that follow it: the plugin keeps the contact table
