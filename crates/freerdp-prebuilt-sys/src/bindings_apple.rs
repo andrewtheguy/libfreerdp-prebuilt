@@ -26,6 +26,17 @@
 // portable across both rather than nearly so; see gen-bindings.sh.
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 #![allow(clippy::all)]
+//
+// Two of MS-RDPEI's client entry points take a `va_list` — the `…RawEventVA`
+// twins of the variadic `TouchRawEvent` and `PenRawEvent` — and they are struct
+// *fields*, so blocklisting the typedef leaves a name to supply. Supplied here as
+// function pointers whose last argument is an opaque pointer: the field is a
+// pointer either way, so the struct's layout is exact on both architectures, and
+// nothing calls them — the wrapper uses the non-variadic Begin/Update/End/Cancel.
+// Calling one through this signature would be wrong on aarch64, where a va_list is
+// a struct passed by value; do not.
+pub type pcRdpeiTouchRawEventVA = ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext, externalId: INT32, x: INT32, y: INT32, contactId: *mut INT32, contactFlags: UINT32, fieldFlags: UINT32, args: *mut ::std::os::raw::c_void) -> UINT>;
+pub type pcRdpeiPenRawEventVA = ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext, externalId: INT32, contactFlags: UINT32, fieldFlags: UINT32, x: INT32, y: INT32, args: *mut ::std::os::raw::c_void) -> UINT>;
 
 pub const __MACOSX__: u32 = 1;
 pub const SPI_SETSCREENSAVEACTIVE: u32 = 17;
@@ -6026,6 +6037,17 @@ pub const COMMAND_LINE_STATUS_PRINT_HELP: i32 = -2002;
 pub const COMMAND_LINE_STATUS_PRINT_VERSION: i32 = -2003;
 pub const COMMAND_LINE_STATUS_PRINT_BUILDCONFIG: i32 = -2004;
 pub const COMMAND_LINE_STATUS_PRINT_LAST: i32 = -2999;
+pub const RDPINPUT_HEADER_LENGTH: u32 = 6;
+pub const RDPINPUT_MAX_PDU_LENGTH: u32 = 2621400;
+pub const RDPEI_CHANNEL_NAME: &[u8; 6] = b"rdpei\0";
+pub const RDPEI_DVC_CHANNEL_NAME: &[u8; 31] = b"Microsoft::Windows::RDS::Input\0";
+pub const SC_READY_MULTIPEN_INJECTION_SUPPORTED: u32 = 1;
+pub const CS_READY_FLAGS_SHOW_TOUCH_VISUALS: u32 = 1;
+pub const CS_READY_FLAGS_DISABLE_TIMESTAMP_INJECTION: u32 = 2;
+pub const CS_READY_FLAGS_ENABLE_MULTIPEN_INJECTION: u32 = 4;
+pub const CONTACT_DATA_CONTACTRECT_PRESENT: u32 = 1;
+pub const CONTACT_DATA_ORIENTATION_PRESENT: u32 = 2;
+pub const CONTACT_DATA_PRESSURE_PRESENT: u32 = 4;
 pub const RDP_CLIENT_INTERFACE_VERSION: u32 = 1;
 pub const RDP_CLIENT_ENTRY_POINT_NAME: &[u8; 15] = b"RdpClientEntry\0";
 pub const FREERDP_MAX_TOUCH_CONTACTS: u32 = 10;
@@ -28128,6 +28150,333 @@ extern "C" {
         name: *const ::std::os::raw::c_char,
     ) -> BOOL;
 }
+pub const RDPINPUT_PROTOCOL_V10: _bindgen_ty_9 = 65536;
+pub const RDPINPUT_PROTOCOL_V101: _bindgen_ty_9 = 65537;
+pub const RDPINPUT_PROTOCOL_V200: _bindgen_ty_9 = 131072;
+pub const RDPINPUT_PROTOCOL_V300: _bindgen_ty_9 = 196608;
+pub type _bindgen_ty_9 = ::std::os::raw::c_uint;
+pub const RDPINPUT_PEN_FIELDS_PRESENT_RDPINPUT_PEN_CONTACT_PENFLAGS_PRESENT:
+    RDPINPUT_PEN_FIELDS_PRESENT = 1;
+pub const RDPINPUT_PEN_FIELDS_PRESENT_RDPINPUT_PEN_CONTACT_PRESSURE_PRESENT:
+    RDPINPUT_PEN_FIELDS_PRESENT = 2;
+pub const RDPINPUT_PEN_FIELDS_PRESENT_RDPINPUT_PEN_CONTACT_ROTATION_PRESENT:
+    RDPINPUT_PEN_FIELDS_PRESENT = 4;
+pub const RDPINPUT_PEN_FIELDS_PRESENT_RDPINPUT_PEN_CONTACT_TILTX_PRESENT:
+    RDPINPUT_PEN_FIELDS_PRESENT = 8;
+pub const RDPINPUT_PEN_FIELDS_PRESENT_RDPINPUT_PEN_CONTACT_TILTY_PRESENT:
+    RDPINPUT_PEN_FIELDS_PRESENT = 16;
+pub type RDPINPUT_PEN_FIELDS_PRESENT = ::std::os::raw::c_uint;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_DOWN: RDPINPUT_CONTACT_FLAGS = 1;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_UPDATE: RDPINPUT_CONTACT_FLAGS = 2;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_UP: RDPINPUT_CONTACT_FLAGS = 4;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_INRANGE: RDPINPUT_CONTACT_FLAGS = 8;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_INCONTACT: RDPINPUT_CONTACT_FLAGS = 16;
+pub const RDPINPUT_CONTACT_FLAGS_RDPINPUT_CONTACT_FLAG_CANCELED: RDPINPUT_CONTACT_FLAGS = 32;
+pub type RDPINPUT_CONTACT_FLAGS = ::std::os::raw::c_uint;
+pub const RDPINPUT_PEN_FLAGS_RDPINPUT_PEN_FLAG_BARREL_PRESSED: RDPINPUT_PEN_FLAGS = 1;
+pub const RDPINPUT_PEN_FLAGS_RDPINPUT_PEN_FLAG_ERASER_PRESSED: RDPINPUT_PEN_FLAGS = 2;
+pub const RDPINPUT_PEN_FLAGS_RDPINPUT_PEN_FLAG_INVERTED: RDPINPUT_PEN_FLAGS = 4;
+pub type RDPINPUT_PEN_FLAGS = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_CONTACT_DATA {
+    pub contactId: UINT32,
+    pub fieldsPresent: UINT16,
+    pub x: INT32,
+    pub y: INT32,
+    pub contactFlags: UINT32,
+    pub contactRectLeft: INT16,
+    pub contactRectTop: INT16,
+    pub contactRectRight: INT16,
+    pub contactRectBottom: INT16,
+    pub orientation: UINT32,
+    pub pressure: UINT32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_CONTACT_DATA"][::std::mem::size_of::<RDPINPUT_CONTACT_DATA>() - 36usize];
+    ["Alignment of RDPINPUT_CONTACT_DATA"]
+        [::std::mem::align_of::<RDPINPUT_CONTACT_DATA>() - 4usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactId"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactId) - 0usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::fieldsPresent"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, fieldsPresent) - 4usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::x"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, x) - 8usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::y"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, y) - 12usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactFlags"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactFlags) - 16usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactRectLeft"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactRectLeft) - 20usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactRectTop"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactRectTop) - 22usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactRectRight"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactRectRight) - 24usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::contactRectBottom"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, contactRectBottom) - 26usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::orientation"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, orientation) - 28usize];
+    ["Offset of field: RDPINPUT_CONTACT_DATA::pressure"]
+        [::std::mem::offset_of!(RDPINPUT_CONTACT_DATA, pressure) - 32usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_TOUCH_FRAME {
+    pub contactCount: UINT16,
+    pub frameOffset: UINT64,
+    pub contacts: *mut RDPINPUT_CONTACT_DATA,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_TOUCH_FRAME"][::std::mem::size_of::<RDPINPUT_TOUCH_FRAME>() - 24usize];
+    ["Alignment of RDPINPUT_TOUCH_FRAME"][::std::mem::align_of::<RDPINPUT_TOUCH_FRAME>() - 8usize];
+    ["Offset of field: RDPINPUT_TOUCH_FRAME::contactCount"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_FRAME, contactCount) - 0usize];
+    ["Offset of field: RDPINPUT_TOUCH_FRAME::frameOffset"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_FRAME, frameOffset) - 8usize];
+    ["Offset of field: RDPINPUT_TOUCH_FRAME::contacts"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_FRAME, contacts) - 16usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_TOUCH_EVENT {
+    pub encodeTime: UINT32,
+    pub frameCount: UINT16,
+    pub frames: *mut RDPINPUT_TOUCH_FRAME,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_TOUCH_EVENT"][::std::mem::size_of::<RDPINPUT_TOUCH_EVENT>() - 16usize];
+    ["Alignment of RDPINPUT_TOUCH_EVENT"][::std::mem::align_of::<RDPINPUT_TOUCH_EVENT>() - 8usize];
+    ["Offset of field: RDPINPUT_TOUCH_EVENT::encodeTime"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_EVENT, encodeTime) - 0usize];
+    ["Offset of field: RDPINPUT_TOUCH_EVENT::frameCount"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_EVENT, frameCount) - 4usize];
+    ["Offset of field: RDPINPUT_TOUCH_EVENT::frames"]
+        [::std::mem::offset_of!(RDPINPUT_TOUCH_EVENT, frames) - 8usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_PEN_CONTACT {
+    pub deviceId: UINT8,
+    pub fieldsPresent: UINT16,
+    pub x: INT32,
+    pub y: INT32,
+    pub contactFlags: UINT32,
+    pub penFlags: UINT32,
+    pub rotation: UINT16,
+    pub pressure: UINT32,
+    pub tiltX: INT16,
+    pub tiltY: INT16,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_PEN_CONTACT"][::std::mem::size_of::<RDPINPUT_PEN_CONTACT>() - 32usize];
+    ["Alignment of RDPINPUT_PEN_CONTACT"][::std::mem::align_of::<RDPINPUT_PEN_CONTACT>() - 4usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::deviceId"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, deviceId) - 0usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::fieldsPresent"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, fieldsPresent) - 2usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::x"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, x) - 4usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::y"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, y) - 8usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::contactFlags"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, contactFlags) - 12usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::penFlags"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, penFlags) - 16usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::rotation"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, rotation) - 20usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::pressure"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, pressure) - 24usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::tiltX"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, tiltX) - 28usize];
+    ["Offset of field: RDPINPUT_PEN_CONTACT::tiltY"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_CONTACT, tiltY) - 30usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_PEN_FRAME {
+    pub contactCount: UINT16,
+    pub frameOffset: UINT64,
+    pub contacts: *mut RDPINPUT_PEN_CONTACT,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_PEN_FRAME"][::std::mem::size_of::<RDPINPUT_PEN_FRAME>() - 24usize];
+    ["Alignment of RDPINPUT_PEN_FRAME"][::std::mem::align_of::<RDPINPUT_PEN_FRAME>() - 8usize];
+    ["Offset of field: RDPINPUT_PEN_FRAME::contactCount"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_FRAME, contactCount) - 0usize];
+    ["Offset of field: RDPINPUT_PEN_FRAME::frameOffset"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_FRAME, frameOffset) - 8usize];
+    ["Offset of field: RDPINPUT_PEN_FRAME::contacts"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_FRAME, contacts) - 16usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct RDPINPUT_PEN_EVENT {
+    pub encodeTime: UINT32,
+    pub frameCount: UINT16,
+    pub frames: *mut RDPINPUT_PEN_FRAME,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of RDPINPUT_PEN_EVENT"][::std::mem::size_of::<RDPINPUT_PEN_EVENT>() - 16usize];
+    ["Alignment of RDPINPUT_PEN_EVENT"][::std::mem::align_of::<RDPINPUT_PEN_EVENT>() - 8usize];
+    ["Offset of field: RDPINPUT_PEN_EVENT::encodeTime"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_EVENT, encodeTime) - 0usize];
+    ["Offset of field: RDPINPUT_PEN_EVENT::frameCount"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_EVENT, frameCount) - 4usize];
+    ["Offset of field: RDPINPUT_PEN_EVENT::frames"]
+        [::std::mem::offset_of!(RDPINPUT_PEN_EVENT, frames) - 8usize];
+};
+pub type RdpeiClientContext = s_rdpei_client_context;
+pub type pcRdpeiGetVersion =
+    ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext) -> UINT32>;
+pub type pcRdpeiGetFeatures =
+    ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext) -> UINT32>;
+pub type pcRdpeiAddContact = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        contact: *const RDPINPUT_CONTACT_DATA,
+    ) -> UINT,
+>;
+pub type pcRdpeiTouchEvent = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        externalId: INT32,
+        x: INT32,
+        y: INT32,
+        contactId: *mut INT32,
+    ) -> UINT,
+>;
+pub type pcRdpeiTouchRawEvent = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        externalId: INT32,
+        x: INT32,
+        y: INT32,
+        contactId: *mut INT32,
+        contactFlags: UINT32,
+        fieldFlags: UINT32,
+        ...
+    ) -> UINT,
+>;
+pub type pcRdpeiAddPen = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        externalId: INT32,
+        contact: *const RDPINPUT_PEN_CONTACT,
+    ) -> UINT,
+>;
+pub type pcRdpeiPen = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        externalId: INT32,
+        fieldFlags: UINT32,
+        x: INT32,
+        y: INT32,
+        ...
+    ) -> UINT,
+>;
+pub type pcRdpeiPenRawEvent = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: *mut RdpeiClientContext,
+        externalId: INT32,
+        contactFlags: UINT32,
+        fieldFlags: UINT32,
+        x: INT32,
+        y: INT32,
+        ...
+    ) -> UINT,
+>;
+pub type pcRdpeiSuspendTouch =
+    ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext) -> UINT>;
+pub type pcRdpeiResumeTouch =
+    ::std::option::Option<unsafe extern "C" fn(context: *mut RdpeiClientContext) -> UINT>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct s_rdpei_client_context {
+    pub handle: *mut ::std::os::raw::c_void,
+    pub custom: *mut ::std::os::raw::c_void,
+    pub GetVersion: pcRdpeiGetVersion,
+    pub GetFeatures: pcRdpeiGetFeatures,
+    pub AddContact: pcRdpeiAddContact,
+    pub TouchBegin: pcRdpeiTouchEvent,
+    pub TouchUpdate: pcRdpeiTouchEvent,
+    pub TouchEnd: pcRdpeiTouchEvent,
+    pub AddPen: pcRdpeiAddPen,
+    pub PenBegin: pcRdpeiPen,
+    pub PenUpdate: pcRdpeiPen,
+    pub PenEnd: pcRdpeiPen,
+    pub PenHoverBegin: pcRdpeiPen,
+    pub PenHoverUpdate: pcRdpeiPen,
+    pub PenHoverCancel: pcRdpeiPen,
+    pub SuspendTouch: pcRdpeiSuspendTouch,
+    pub ResumeTouch: pcRdpeiResumeTouch,
+    pub TouchCancel: pcRdpeiTouchEvent,
+    pub TouchRawEvent: pcRdpeiTouchRawEvent,
+    pub TouchRawEventVA: pcRdpeiTouchRawEventVA,
+    pub PenCancel: pcRdpeiPen,
+    pub PenRawEvent: pcRdpeiPenRawEvent,
+    pub PenRawEventVA: pcRdpeiPenRawEventVA,
+    pub clientFeaturesMask: UINT32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of s_rdpei_client_context"][::std::mem::size_of::<s_rdpei_client_context>() - 192usize];
+    ["Alignment of s_rdpei_client_context"]
+        [::std::mem::align_of::<s_rdpei_client_context>() - 8usize];
+    ["Offset of field: s_rdpei_client_context::handle"]
+        [::std::mem::offset_of!(s_rdpei_client_context, handle) - 0usize];
+    ["Offset of field: s_rdpei_client_context::custom"]
+        [::std::mem::offset_of!(s_rdpei_client_context, custom) - 8usize];
+    ["Offset of field: s_rdpei_client_context::GetVersion"]
+        [::std::mem::offset_of!(s_rdpei_client_context, GetVersion) - 16usize];
+    ["Offset of field: s_rdpei_client_context::GetFeatures"]
+        [::std::mem::offset_of!(s_rdpei_client_context, GetFeatures) - 24usize];
+    ["Offset of field: s_rdpei_client_context::AddContact"]
+        [::std::mem::offset_of!(s_rdpei_client_context, AddContact) - 32usize];
+    ["Offset of field: s_rdpei_client_context::TouchBegin"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchBegin) - 40usize];
+    ["Offset of field: s_rdpei_client_context::TouchUpdate"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchUpdate) - 48usize];
+    ["Offset of field: s_rdpei_client_context::TouchEnd"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchEnd) - 56usize];
+    ["Offset of field: s_rdpei_client_context::AddPen"]
+        [::std::mem::offset_of!(s_rdpei_client_context, AddPen) - 64usize];
+    ["Offset of field: s_rdpei_client_context::PenBegin"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenBegin) - 72usize];
+    ["Offset of field: s_rdpei_client_context::PenUpdate"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenUpdate) - 80usize];
+    ["Offset of field: s_rdpei_client_context::PenEnd"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenEnd) - 88usize];
+    ["Offset of field: s_rdpei_client_context::PenHoverBegin"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenHoverBegin) - 96usize];
+    ["Offset of field: s_rdpei_client_context::PenHoverUpdate"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenHoverUpdate) - 104usize];
+    ["Offset of field: s_rdpei_client_context::PenHoverCancel"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenHoverCancel) - 112usize];
+    ["Offset of field: s_rdpei_client_context::SuspendTouch"]
+        [::std::mem::offset_of!(s_rdpei_client_context, SuspendTouch) - 120usize];
+    ["Offset of field: s_rdpei_client_context::ResumeTouch"]
+        [::std::mem::offset_of!(s_rdpei_client_context, ResumeTouch) - 128usize];
+    ["Offset of field: s_rdpei_client_context::TouchCancel"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchCancel) - 136usize];
+    ["Offset of field: s_rdpei_client_context::TouchRawEvent"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchRawEvent) - 144usize];
+    ["Offset of field: s_rdpei_client_context::TouchRawEventVA"]
+        [::std::mem::offset_of!(s_rdpei_client_context, TouchRawEventVA) - 152usize];
+    ["Offset of field: s_rdpei_client_context::PenCancel"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenCancel) - 160usize];
+    ["Offset of field: s_rdpei_client_context::PenRawEvent"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenRawEvent) - 168usize];
+    ["Offset of field: s_rdpei_client_context::PenRawEventVA"]
+        [::std::mem::offset_of!(s_rdpei_client_context, PenRawEventVA) - 176usize];
+    ["Offset of field: s_rdpei_client_context::clientFeaturesMask"]
+        [::std::mem::offset_of!(s_rdpei_client_context, clientFeaturesMask) - 184usize];
+};
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct MIBClientWrapper {
@@ -28258,7 +28607,7 @@ pub struct rdp_client_context {
     pub context: rdpContext,
     pub thread: HANDLE,
     pub reserved1: UINT64,
-    pub reserved2: UINT64,
+    pub rdpei: *mut RdpeiClientContext,
     pub lastX: INT32,
     pub __bindgen_padding_0: u32,
     pub lastY: INT32,
@@ -28281,8 +28630,8 @@ const _: () = {
         [::std::mem::offset_of!(rdp_client_context, thread) - 1024usize];
     ["Offset of field: rdp_client_context::reserved1"]
         [::std::mem::offset_of!(rdp_client_context, reserved1) - 1032usize];
-    ["Offset of field: rdp_client_context::reserved2"]
-        [::std::mem::offset_of!(rdp_client_context, reserved2) - 1040usize];
+    ["Offset of field: rdp_client_context::rdpei"]
+        [::std::mem::offset_of!(rdp_client_context, rdpei) - 1040usize];
     ["Offset of field: rdp_client_context::lastX"]
         [::std::mem::offset_of!(rdp_client_context, lastX) - 1048usize];
     ["Offset of field: rdp_client_context::lastY"]

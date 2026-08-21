@@ -135,6 +135,12 @@ generate() {
   # keeps the constants-not-Rust-enums property that matters: these are still integers, so a key
   # a future FreeRDP adds cannot be undefined behaviour.
   #
+  # `--with-derive-custom-struct` on the rdpei context, because bindgen will not *infer* derives
+  # for a struct with a field of a blocklisted type — it cannot see what the raw-line stand-in
+  # for `pcRdpeiTouchRawEventVA` is — and so emitted this one context without the
+  # `Debug, Copy, Clone` every other channel context has. The stand-ins are `Option<fn>`s, which
+  # are all three, so the derives are asked for by name.
+  #
   # `--rust-target` pinned for the same reason the bindgen version is, and it is the one flag
   # that decides this crate's MSRV: bindgen defaults to the newest Rust it knows about, and from
   # 1.82 it emits `unsafe extern "C" { … }` blocks which do not parse on an older compiler.
@@ -156,6 +162,8 @@ generate() {
     --blocklist-type 'ArrayList_ForEachFkt' \
     --blocklist-type '(__builtin_|__gnuc_)?va_list' \
     --blocklist-type '__va_list_tag' \
+    --blocklist-type 'pcRdpei(TouchRaw|PenRaw)EventVA' \
+    --with-derive-custom-struct 's_rdpei_client_context=Debug,Copy,Clone' \
     --blocklist-item '_M_[A-Z0-9_]*' \
     --blocklist-item 'MEMORY_ALLOCATION_ALIGNMENT' \
     --default-enum-style consts \
@@ -187,6 +195,17 @@ generate() {
     --raw-line "// portable across both rather than nearly so; see gen-bindings.sh." \
     --raw-line "#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]" \
     --raw-line "#![allow(clippy::all)]" \
+    --raw-line "//" \
+    --raw-line "// Two of MS-RDPEI's client entry points take a \`va_list\` — the \`…RawEventVA\`" \
+    --raw-line "// twins of the variadic \`TouchRawEvent\` and \`PenRawEvent\` — and they are struct" \
+    --raw-line "// *fields*, so blocklisting the typedef leaves a name to supply. Supplied here as" \
+    --raw-line "// function pointers whose last argument is an opaque pointer: the field is a" \
+    --raw-line "// pointer either way, so the struct's layout is exact on both architectures, and" \
+    --raw-line "// nothing calls them — the wrapper uses the non-variadic Begin/Update/End/Cancel." \
+    --raw-line "// Calling one through this signature would be wrong on aarch64, where a va_list is" \
+    --raw-line "// a struct passed by value; do not." \
+    --raw-line "pub type pcRdpeiTouchRawEventVA = ::std::option::Option<unsafe extern \"C\" fn(context: *mut RdpeiClientContext, externalId: INT32, x: INT32, y: INT32, contactId: *mut INT32, contactFlags: UINT32, fieldFlags: UINT32, args: *mut ::std::os::raw::c_void) -> UINT>;" \
+    --raw-line "pub type pcRdpeiPenRawEventVA = ::std::option::Option<unsafe extern \"C\" fn(context: *mut RdpeiClientContext, externalId: INT32, contactFlags: UINT32, fieldFlags: UINT32, x: INT32, y: INT32, args: *mut ::std::os::raw::c_void) -> UINT>;" \
     -- -I include/freerdp3 -I include/winpr3
 }
 

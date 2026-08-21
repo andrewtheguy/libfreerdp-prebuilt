@@ -196,8 +196,8 @@ rdp_src="$here/build/freerdp-${FREERDP_VERSION}"
 #     sees the 600-field `rdp_settings` struct. The largest source of layout risk, removed
 #     rather than checked.
 #
-# **Why disp, rdpgfx, rdpsnd and rdpdr are ON in an archive whose first consumer calls none of
-# them.** `channels/client/CMakeLists.txt` generates `tables.c` at *configure* time from the
+# **Why disp, rdpgfx, rdpsnd, rdpdr and rdpei are ON in an archive whose first consumer called none
+# of them.** `channels/client/CMakeLists.txt` generates `tables.c` at *configure* time from the
 # enabled set, and `client/common/CMakeLists.txt` links those OBJECT libraries into
 # libfreerdp-client3. The channel list is therefore baked into the archive and a consumer cannot
 # enable one later — so resize (disp) and audio (rdpsnd) would each need a new archive and a new
@@ -265,13 +265,20 @@ cmake_args=(
   -DCHANNEL_RDPGFX=ON -DCHANNEL_RDPGFX_CLIENT=ON
   -DCHANNEL_RDPSND=ON -DCHANNEL_RDPSND_CLIENT=ON
   -DCHANNEL_RDPDR=ON -DCHANNEL_RDPDR_CLIENT=ON
+  # Touch. `rdpei` is MS-RDPEI, the `Microsoft::Windows::RDS::Input` dynamic channel a Windows
+  # host injects real touch contacts from — the one mstsc on a tablet uses, so every shell
+  # gesture (edge swipes, pinch, multi-finger) is the host's own rather than an emulation. Like
+  # `disp` it is a DVC under `cmake_dependent_option(… CHANNEL_DRDYNVC)`, and like every channel
+  # here it has to be in the archive at configure time; the consumer turns it on per session
+  # through `FreeRDP_MultiTouchInput`, which `client/common/cmdline.c` maps to the addin.
+  -DCHANNEL_RDPEI=ON -DCHANNEL_RDPEI_CLIENT=ON
 )
 
 # Every other channel, off by name. A loop rather than a hand-written list, so a channel FreeRDP
 # adds in a later release is off by *default* and turned on deliberately, never by inheriting
 # somebody's idea of a sensible default.
 for channel in ainput audin drive echo encomsp geometry gfxredir location parallel printer rail \
-  rdp2tcp rdpear rdpecam rdpei rdpemsc rdpewa remdesk serial smartcard sshagent telemetry tsmf \
+  rdp2tcp rdpear rdpecam rdpemsc rdpewa remdesk serial smartcard sshagent telemetry tsmf \
   urbdrc video; do
   upper="$(tr '[:lower:]' '[:upper:]' <<<"$channel")"
   cmake_args+=("-DCHANNEL_${upper}=OFF")
@@ -424,7 +431,7 @@ entry_points='freerdp_client_context_new freerdp_client_context_free
               freerdp_input_send_mouse_event freerdp_input_send_extended_mouse_event
               freerdp_input_send_keyboard_event freerdp_input_send_unicode_keyboard_event
               gdi_init gdi_free gdi_graphics_pipeline_init graphics_register_pointer
-              freerdp_client_load_addins PubSub_Subscribe'
+              freerdp_client_load_addins PubSub_Subscribe freerdp_client_handle_touch'
 # `PubSub_Subscribe` rather than `PubSub_SubscribeChannelConnected`, which is what the wrapper
 # reads like in C: WinPR generates the per-event subscribers as `static inline` functions from a
 # macro, so they exist in no archive and bindgen emits none of them. The wrapper calls the
@@ -434,7 +441,7 @@ echo "   $(printf '%s\n' "$entry_points" | wc -w | tr -d ' ') entry points defin
 
 echo ">> verifying the channels are compiled in"
 # Per channel, the symbol its own registration goes through — a static virtual-channel entry for
-# the two SVCs, a DVC plugin entry for the three dynamic ones. This is how "the channel is really
+# the SVCs, a DVC plugin entry for the dynamic ones. This is how "the channel is really
 # in there" is known rather than believed, and it is what would silently go missing if a
 # `CHANNEL_*` option were renamed upstream and the `-D` above became a no-op. (It could not
 # become a *silent* no-op — the unused-variable check above sees to that — but a channel can also
@@ -442,7 +449,7 @@ echo ">> verifying the channels are compiled in"
 channels=''
 for entry in cliprdr_VirtualChannelEntryEx:cliprdr rdpdr_VirtualChannelEntryEx:rdpdr \
   rdpsnd_VirtualChannelEntryEx:rdpsnd drdynvc_VirtualChannelEntryEx:drdynvc \
-  disp_DVCPluginEntry:disp rdpgfx_DVCPluginEntry:rdpgfx; do
+  disp_DVCPluginEntry:disp rdpgfx_DVCPluginEntry:rdpgfx rdpei_DVCPluginEntry:rdpei; do
   require_symbol "${entry%%:*}"
   channels+="${entry##*:} "
 done

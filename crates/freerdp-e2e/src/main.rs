@@ -204,6 +204,10 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         // On for the resize leg below, and this is the only place in the repository that turns it
         // on — `Connect::resize` says why it is off by default.
         resize: true,
+        // On so the touch leg can *report*: whether the host opens MS-RDPEI is a property of the
+        // host (Windows 8 and later do; xrdp never does), so it is printed rather than asserted,
+        // like the clipboard's and audio's "not offered".
+        touch: true,
         // `E2E_EGFX=0` runs the same legs down the **legacy orders path** instead of the graphics
         // pipeline. The caches in `apply_settings` take effect only on that path, and until this
         // knob existed this program hardcoded itself out of reaching it — a test that reaches one
@@ -226,6 +230,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     let mut pixels = 0usize;
     let mut frames = 0usize;
     let mut resize_ready = false;
+    let mut touch_ready = false;
     let mut clipboard_ready = false;
 
     while Instant::now() < deadline {
@@ -256,6 +261,10 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
             Event::ResizeReady { max_monitors, max_area } => {
                 println!("displaycontrol  up to {max_monitors} monitors, {max_area} pixels");
                 resize_ready = true;
+            }
+            Event::TouchReady => {
+                println!("rdpei           the host opened the touch channel");
+                touch_ready = true;
             }
             Event::Clipboard(ClipboardEvent::Ready) => {
                 println!("cliprdr         capability exchange finished");
@@ -294,6 +303,11 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
     // silent absence is visible rather than looking like coverage.
     if !clipboard_ready {
         println!("cliprdr         not offered by this server");
+    }
+    // The same shape for touch, and the same reason: xrdp has no MS-RDPEI, so against the
+    // pipeline's container this line is the expected answer rather than a failure.
+    if !touch_ready {
+        println!("rdpei           not offered by this server");
     }
 
     // The framebuffer is not merely allocated: something wrote to it. A connected session whose

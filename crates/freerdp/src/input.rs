@@ -1,4 +1,4 @@
-//! Keyboard and mouse, encoded here and sent on the FreeRDP thread.
+//! Keyboard, mouse and touch, encoded here and sent on the FreeRDP thread.
 //!
 //! Every method on [`Input`] pushes one [`Command`] and wakes the session thread. Nothing blocks,
 //! nothing can fail visibly, and a call made after the session has ended is dropped — which is
@@ -23,6 +23,19 @@ pub enum MouseButton {
     X2,
 }
 
+/// What a touch contact did, in the four transitions MS-RDPEI's state machine has
+/// (3.1.1.1): down, an update while down, up, and an abort that is not a tap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+    /// The contact was lost rather than lifted — the finger left the digitizer's surface area,
+    /// the window lost it, the client went away. A host treats it as "forget this gesture",
+    /// where an [`Up`](Self::Up) in the same place would be a tap.
+    Cancel,
+}
+
 /// One thing for the FreeRDP thread to do next time it wakes.
 pub(crate) enum Command {
     Mouse { flags: u16, x: u16, y: u16 },
@@ -34,6 +47,8 @@ pub(crate) enum Command {
     Refresh,
     /// Ask the server for a new desktop size, over `disp`.
     Resize { width: u32, height: u32, scale_percent: u32 },
+    /// One touch contact transition, over `rdpei`.
+    Touch { phase: TouchPhase, id: i32, x: i32, y: i32 },
     ClipboardAdvertise(Vec<ClipboardFormat>),
     ClipboardRequest(u32),
     ClipboardRespond { format: u32, data: Option<Vec<u8>> },
@@ -192,6 +207,32 @@ impl Input {
     pub fn resize(&self, width: u32, height: u32, scale_percent: u32) {
         let (width, height) = sanitise_size(width, height);
         self.push(Command::Resize { width, height, scale_percent: sanitise_scale(scale_percent) });
+    }
+
+    /// Move one touch contact through a transition, at a position in desktop pixels.
+    ///
+    /// Needs [`Connect::touch`](crate::Connect::touch) and a server that opens the touch channel —
+    /// announced as [`Event::TouchReady`](crate::Event::TouchReady). Before that, and on a
+    /// session that never gets the channel, the contact is **dropped**, not held: a finger is a
+    /// moment, and replaying one later would be a gesture nobody made. Dropped too while the host
+    /// has *suspended* touch — see [`Event::TouchReady`](crate::Event::TouchReady) — and a
+    /// contact that was down when the host did so is cancelled on its behalf.
+    ///
+    /// `id` is the caller's name for the finger, and it is the only thing tying a `Down` to the
+    /// `Move`s, and the `Up` or `Cancel`, that follow it: the plugin keeps the contact table
+    /// (ten contacts, `MAX_CONTACTS` in rdpei), allocates a slot on `Down`, finds it by this id
+    /// afterwards, and frees it on `Up` and `Cancel`. Any `i32` does; reusing an id for a new
+    /// finger after its `Up` is fine, and a `Down` on an id that is still down takes a second
+    /// slot — so a caller whose source can lose an up (a browser's `touchcancel`, a window that
+    /// blurred mid-gesture) should cancel what it still has down rather than rely on the next
+    /// down to tidy up.
+    ///
+    /// `x` and `y` are desktop pixels, like the mouse — the host takes them as absolute
+    /// digitizer positions, and a contact outside the desktop is the host's to clamp. A
+    /// `Down`…`Up` at one position is a tap; the host's own gesture recogniser does the rest,
+    /// which is the point of sending contacts rather than interpreting them here.
+    pub fn touch(&self, phase: TouchPhase, id: i32, x: i32, y: i32) {
+        self.push(Command::Touch { phase, id, x, y });
     }
 
     fn mouse(&self, flags: u16, x: u16, y: u16) {

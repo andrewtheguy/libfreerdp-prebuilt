@@ -51,6 +51,10 @@
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/client/disp.h>
 #include <freerdp/client/rdpgfx.h>
+// Touch: MS-RDPEI's client context, which is how contacts are injected into a Windows host as
+// real touch pointers rather than as a mouse. Claimed in the same ChannelConnected handler as
+// `disp`, under the long `Microsoft::Windows::RDS::Input` name `rdpei.h` defines.
+#include <freerdp/client/rdpei.h>
 
 // Sound, which arrives through neither of those routes. `rdpsnd` has no client context to
 // subscribe to: it loads a *device* — the thing an ordinary client points at ALSA or CoreAudio —

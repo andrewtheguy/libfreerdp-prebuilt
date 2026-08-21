@@ -22,9 +22,9 @@ use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
 use crate::mic::Microphone;
 use crate::error::Error;
 use crate::framebuffer::{Framebuffer, Rect};
-use crate::input::{Command, Input};
+use crate::input::{Command, Input, TouchPhase};
 use crate::pointer::{self, Cursor};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CString};
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, Sender};
@@ -151,6 +151,21 @@ pub struct Connect {
     /// them, and still surfaces as the one [`Event::Resize`]. See `resize` in this module for
     /// the measurements.
     pub egfx: bool,
+    /// Whether to load `rdpei` and advertise multitouch, which is what makes
+    /// [`Input::touch`](crate::Input::touch) do anything.
+    ///
+    /// MS-RDPEI is the channel a Windows host takes *touch contacts* on — the one its own
+    /// client uses from a tablet — and a contact injected there is a real touch pointer to the
+    /// host: the shell's edge swipes, pinch, press-and-hold and multi-finger gestures are all the
+    /// host's own doing, with nothing emulated on this side. Which is also why it is a separate
+    /// switch from the mouse: a session that only ever has a mouse has no reason to announce a
+    /// digitizer it does not have.
+    ///
+    /// Off by default. A host that supports it opens the channel shortly after connecting, which
+    /// arrives as [`Event::TouchReady`]; one that does not (xrdp, and every VNC-era host) never
+    /// opens it, and contacts sent anyway are dropped — like every other input on a session that
+    /// cannot carry it.
+    pub touch: bool,
     pub connect_timeout: Duration,
     pub keepalive: KeepAlive,
 }
@@ -172,6 +187,7 @@ impl Default for Connect {
             microphone: None,
             resize: false,
             egfx: true,
+            touch: false,
             connect_timeout: Duration::from_secs(15),
             keepalive: KeepAlive::default(),
         }
@@ -221,6 +237,27 @@ pub enum Event {
     /// `max_area` is the largest total monitor area the server will accept, in pixels; this crate
     /// asks for one monitor, so it bounds `width * height`.
     ResizeReady { max_monitors: u32, max_area: u64 },
+    /// The server opened the touch channel, so [`Input::touch`](crate::Input::touch) now has
+    /// somewhere to go. Only ever sent on a session configured with [`Connect::touch`], and not
+    /// at all by a server that does not implement MS-RDPEI — which is the honest signal a consumer
+    /// needs before offering a touchscreen mode to a user.
+    ///
+    /// Unlike DisplayControl, the channel being open *is* the server's half: a dynamic channel is
+    /// created by the server (`drdynvc` fires ChannelConnected from the server's create request),
+    /// and a host that creates this one sends its `SC_READY` on it straight away. Straight away
+    /// is not *already*, though. The `rdpei` plugin exposes no hook for the `SC_READY` itself —
+    /// its version starts at V3 and only ever lowers, its features may legitimately be zero — so
+    /// this fires one channel round trip before the `CS_READY` the plugin answers with, and a
+    /// contact sent inside that window goes on the wire ahead of `CS_READY`, which MS-RDPEI does
+    /// not allow. A consumer's first contact follows a human's first touch, which comes orders of
+    /// magnitude later than a round trip; but it is a window, not nothing, and it is not closable
+    /// from this side of the plugin's interface.
+    ///
+    /// The host can also *suspend* touch later (`RDPINPUT_SUSPEND_TOUCH_PDU`) and resume it
+    /// (`RDPINPUT_RESUME_TOUCH_PDU`). That is handled inside this crate and not announced: while
+    /// suspended, contacts are dropped, and the ones that were down when the suspend arrived are
+    /// cancelled so the host is not left holding a finger that will never lift.
+    TouchReady,
     Cursor(Cursor),
     Clipboard(ClipboardEvent),
     /// The session is over, and the channel is about to close. `Ok(())` is an orderly
@@ -511,6 +548,15 @@ pub(crate) struct Bridge {
     /// Whether the server's DisplayControl capabilities have arrived. Until they do, the channel
     /// exists but the server has not said it will listen.
     resize_ready: bool,
+    /// The touch channel, once the server has opened it, and null before and after. Null is
+    /// also what a contact is dropped on — see [`Input::touch`].
+    rdpei: *mut sys::RdpeiClientContext,
+    /// The contacts that are down, by the caller's id, at their last position — what a suspend
+    /// has to cancel. Cleared with the channel.
+    held_touches: HashMap<i32, (i32, i32)>,
+    /// Whether the host has asked for touch to stop (`SuspendTouch`) and not yet for it to
+    /// resume. Contacts are dropped while this is set; see `send_touch`.
+    touch_suspended: bool,
     /// The most recent size asked for before the channel was ready — only the most recent, since
     /// a resize supersedes every earlier one rather than queueing behind it.
     pending_resize: Option<(u32, u32, u32)>,
@@ -624,6 +670,9 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
         pending_advertise: None,
         disp: std::ptr::null_mut(),
         resize_ready: false,
+        rdpei: std::ptr::null_mut(),
+        held_touches: HashMap::new(),
+        touch_suspended: false,
         pending_resize: None,
         audio_devices_seen: 0,
         audio_dynamic_negotiated: false,
@@ -895,6 +944,11 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // drive the resolution", and `xf_disp.c` is the only thing that reads it. A headless
         // client has no window, and resizes when its embedder says so.
         (B::FreeRDP_SupportDisplayControl, config.resize),
+        // Touch. The same shape as the line above: this key is both the capability and the
+        // channel switch, since the same addin table maps `FreeRDP_MultiTouchInput` to `rdpei`.
+        // Not paired with `FreeRDP_MultiTouchGestures`, which is xfreerdp's own *local* gesture
+        // recogniser (pinch-to-zoom the window) and nothing a headless client has a use for.
+        (B::FreeRDP_MultiTouchInput, config.touch),
         // Refresh and suppress-output are what make `Input::refresh` and a minimised viewer
         // work; both are cheap capability bits.
         (B::FreeRDP_RefreshRect, true),
@@ -1279,6 +1333,10 @@ unsafe fn execute(ctx: *mut sys::rdpContext, command: Command) {
             // SAFETY: as above.
             unsafe { resize(ctx, width, height, scale_percent) };
         }
+        Command::Touch { phase, id, x, y } => {
+            // SAFETY: as above.
+            unsafe { send_touch(ctx, phase, id, x, y) };
+        }
         Command::ClipboardAdvertise(formats) => {
             // SAFETY: as above.
             unsafe { clipboard_advertise(ctx, formats) };
@@ -1477,6 +1535,90 @@ unsafe fn request_resize(
     // SAFETY: `disp` was stored by `channel_connected` and cleared by `channel_disconnected`, so
     // a non-null one here is live.
     unsafe { send_monitor_layout(bridge.disp, width, height, scale_percent) };
+}
+
+/// Inject one touch contact transition, or drop it if the server never opened the channel — or
+/// has asked, for now, that nothing be injected.
+///
+/// The plugin keeps the contact table: `id` is the caller's *external* id and `rdpei` maps it to
+/// one of its ten `contactId` slots on `Down`, finds it again on `Move`/`Up`/`Cancel`, and frees
+/// it on `Up` and `Cancel` (`rdpei_contact` in `channels/rdpei/client/rdpei_main.c`). An `Up` is
+/// sent by the plugin as an in-contact update followed by the up, which is the transition
+/// MS-RDPEI 3.1.1.1 requires. The returned contact id is not wanted: the caller names contacts,
+/// and the plugin's numbering is the wire's business.
+///
+/// Not routed through `freerdp_client_handle_touch`, deliberately. That helper keeps a second
+/// contact table in `rdpClientContext` whose slots are only released by an *up* — a cancelled
+/// contact (3.22's `FREERDP_TOUCH_CANCEL`) stays in it under its id, so ten cancels with ten
+/// distinct ids fill the table for the rest of the session. Calling the plugin directly has one
+/// table, the plugin's, and it releases on both.
+///
+/// # Safety
+///
+/// `ctx` must be live and connected.
+unsafe fn send_touch(ctx: *mut sys::rdpContext, phase: TouchPhase, id: i32, x: i32, y: i32) {
+    // SAFETY: the caller guarantees the context.
+    let Some(bridge) = (unsafe { bridge(ctx) }) else { return };
+    let rdpei = bridge.rdpei;
+    if rdpei.is_null() {
+        // Dropped rather than held, unlike a resize: a contact is a moment, and a finger that
+        // went down before the channel came up has no meaning by the time it would be sent.
+        return;
+    }
+    if bridge.touch_suspended {
+        // The host said stop. What was down when it said so has already been cancelled by
+        // `touch_suspend`, so nothing arriving here is the tail of a contact the host still
+        // holds; and a `Down` dropped here leaves nothing behind either, since the plugin
+        // answers the `Move`s and `Up` of an id it never gave a slot with a no-op
+        // (`rdpei_contact` finds nothing and `rdpei_touch_process` sends nothing).
+        return;
+    }
+    match phase {
+        TouchPhase::Down => {
+            bridge.held_touches.insert(id, (x, y));
+        }
+        TouchPhase::Move => {
+            if let Some(position) = bridge.held_touches.get_mut(&id) {
+                *position = (x, y);
+            }
+        }
+        TouchPhase::Up | TouchPhase::Cancel => {
+            bridge.held_touches.remove(&id);
+        }
+    }
+    // SAFETY: `rdpei` was stored by `channel_connected` and cleared by `channel_disconnected`,
+    // so a non-null one here is live.
+    unsafe { touch_call(rdpei, phase, id, x, y) }
+}
+
+/// Hand one transition to the plugin.
+///
+/// # Safety
+///
+/// `rdpei` must be a live touch context with the entry points the plugin set on it.
+unsafe fn touch_call(
+    rdpei: *mut sys::RdpeiClientContext,
+    phase: TouchPhase,
+    id: i32,
+    x: i32,
+    y: i32,
+) {
+    // SAFETY: the caller guarantees the context, and every entry point below is set by the
+    // plugin.
+    unsafe {
+        let call = match phase {
+            TouchPhase::Down => (*rdpei).TouchBegin,
+            TouchPhase::Move => (*rdpei).TouchUpdate,
+            TouchPhase::Up => (*rdpei).TouchEnd,
+            TouchPhase::Cancel => (*rdpei).TouchCancel,
+        };
+        let Some(call) = call else { return };
+        let mut contact_id: i32 = -1;
+        // A failure here is the channel's own — a frame that would not encode, a contact the
+        // plugin has no slot for — and the input path has nothing useful to do with it: the
+        // next contact is independent, and the session carries on. Same policy as the mouse.
+        let _ = call(rdpei, id, x, y, &mut contact_id);
+    }
 }
 
 /// Build a one-monitor layout and send it.
@@ -1961,15 +2103,16 @@ unsafe extern "C" fn pointer_set_position(
 
 /// The channel-connected handler, subscribed in `subscribe_channels`.
 ///
-/// Only `cliprdr` and `disp` are claimed here. Everything else falls through to
+/// Only `cliprdr`, `disp` and `rdpei` are claimed here. Everything else falls through to
 /// `freerdp_client_OnChannelConnectedEventHandler`, which is what binds `rdpgfx` to the GDI and
 /// wires up the channels this crate does not touch — so falling through is not "ignoring", it is
 /// letting FreeRDP's own client-common do the part it already does correctly.
 ///
-/// The two names are matched differently for a reason that is not a style: `cliprdr` is a static
-/// virtual channel and arrives under its 8-character SVC name, while `disp` is a *dynamic* one and
-/// arrives under the long `Microsoft::Windows::RDS::DisplayControl` its plugin registered
-/// (`channels/disp/client/disp_main.c`). Matching a DVC on its short name silently never fires.
+/// The names are matched differently for a reason that is not a style: `cliprdr` is a static
+/// virtual channel and arrives under its 8-character SVC name, while `disp` and `rdpei` are
+/// *dynamic* ones and arrive under the long `Microsoft::Windows::RDS::DisplayControl` and
+/// `Microsoft::Windows::RDS::Input` their plugins registered (`channels/disp/client/disp_main.c`,
+/// `channels/rdpei/client/rdpei_main.c`). Matching a DVC on its short name silently never fires.
 unsafe extern "C" fn channel_connected(
     context: *mut c_void,
     e: *const sys::ChannelConnectedEventArgs,
@@ -2008,6 +2151,23 @@ unsafe extern "C" fn channel_connected(
                 // No `resize_ready` here. The channel being open is this client's half; the
                 // server's half is the capabilities PDU, and a layout sent before it goes to a
                 // server that has not agreed to listen.
+            } else if name == sys::RDPEI_DVC_CHANNEL_NAME.as_slice() {
+                let rdpei = (*e).pInterface as *mut sys::RdpeiClientContext;
+                if rdpei.is_null() {
+                    return;
+                }
+                (*rdpei).custom = ctx as *mut c_void;
+                (*rdpei).SuspendTouch = Some(touch_suspend);
+                (*rdpei).ResumeTouch = Some(touch_resume);
+                bridge_ref.rdpei = rdpei;
+                bridge_ref.held_touches.clear();
+                bridge_ref.touch_suspended = false;
+                // Ready now, unlike `disp`: a dynamic channel's ChannelConnected is fired by
+                // `drdynvc` from the *server's* create request (`dvcman_create_channel`), so a
+                // server that opened this one has already said it takes touch. Its `SC_READY`
+                // follows on the same channel one round trip later, and the plugin exposes no
+                // hook for it — the note on `Event::TouchReady` has the window that leaves.
+                bridge_ref.send(Event::TouchReady);
             } else {
                 sys::freerdp_client_OnChannelConnectedEventHandler(context, e);
             }
@@ -2018,8 +2178,9 @@ unsafe extern "C" fn channel_connected(
 /// The other half, and it exists to prevent a use-after-free rather than to tidy up.
 ///
 /// A channel can close while the session lives on — the peer drops it, or the plugin fails — and
-/// closing it frees the interface struct. Without this, `bridge.cliprdr` and `bridge.disp` would
-/// go on pointing at freed memory, and the next `advertise` or `resize` would write through it.
+/// closing it frees the interface struct. Without this, `bridge.cliprdr`, `bridge.disp` and
+/// `bridge.rdpei` would go on pointing at freed memory, and the next `advertise`, `resize` or
+/// `touch` would write through it.
 /// That is a use-after-free that would usually *work*, which is the worst kind.
 unsafe extern "C" fn channel_disconnected(
     context: *mut c_void,
@@ -2038,10 +2199,71 @@ unsafe extern "C" fn channel_disconnected(
             } else if name == sys::DISP_DVC_CHANNEL_NAME.as_slice() {
                 bridge_ref.disp = std::ptr::null_mut();
                 bridge_ref.resize_ready = false;
+            } else if name == sys::RDPEI_DVC_CHANNEL_NAME.as_slice() {
+                bridge_ref.rdpei = std::ptr::null_mut();
+                bridge_ref.held_touches.clear();
+                bridge_ref.touch_suspended = false;
             } else {
                 sys::freerdp_client_OnChannelDisconnectedEventHandler(context, e);
             }
         }
+    })
+}
+
+/// Recover the bridge from an rdpei callback's context.
+///
+/// # Safety
+///
+/// `rdpei` must be the context the plugin passed to one of its callbacks, with `custom` as
+/// `channel_connected` set it.
+unsafe fn rdpei_bridge<'a>(rdpei: *mut sys::RdpeiClientContext) -> Option<&'a mut Bridge> {
+    if rdpei.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees `custom` holds the rdpContext stored by `channel_connected`.
+    let ctx = unsafe { (*rdpei).custom } as *mut sys::rdpContext;
+    // SAFETY: that context is one of ours and outlives the channel.
+    unsafe { bridge(ctx) }
+}
+
+/// The host asked for touch to stop: MS-RDPEI's `RDPINPUT_SUSPEND_TOUCH_PDU`, which the plugin
+/// hands on without acting on — it neither stops its own frames nor frees its contact table
+/// (`rdpei_recv_suspend_touch_pdu` is an `IFCALLRET` and nothing more), and none of FreeRDP's
+/// own clients set this callback at all.
+///
+/// Returns a **channel error code where zero is success**, like the cliprdr callbacks.
+///
+/// Two things, in this order. First the flag, so nothing new goes out. Then a cancel, through
+/// the plugin, for every contact that was down: the host has those as fingers on the glass, the
+/// `Up`s that would have lifted them are about to be dropped, and this is the last word it gets
+/// on them. Going through the plugin is also what frees its slots — `rdpei_add_frame` releases
+/// a slot on the `UP` flag, which a cancel carries — where a dropped `Up` would leak one of the
+/// ten for the rest of the session. The cancel frames do go out after the host asked for
+/// silence; a host that discards them has lost nothing, since a suspended host is not injecting
+/// those contacts anyway.
+unsafe extern "C" fn touch_suspend(rdpei: *mut sys::RdpeiClientContext) -> u32 {
+    guarded("rdpei SuspendTouch", sys::ERROR_INTERNAL_ERROR, || {
+        // SAFETY: the plugin passes a live context whose `custom` is set.
+        let Some(bridge) = (unsafe { rdpei_bridge(rdpei) }) else { return sys::CHANNEL_RC_OK };
+        bridge.touch_suspended = true;
+        for (id, (x, y)) in std::mem::take(&mut bridge.held_touches) {
+            // SAFETY: the plugin's own context, live for the duration of its callback.
+            unsafe { touch_call(rdpei, TouchPhase::Cancel, id, x, y) };
+        }
+        sys::CHANNEL_RC_OK
+    })
+}
+
+/// The other half, `RDPINPUT_RESUME_TOUCH_PDU`. Nothing to replay: the contacts cancelled on
+/// suspend are over, a finger that stayed on the glass throughout is over for the host too —
+/// its remaining `Move`s and `Up` are no-ops at the plugin — and the next `Down` is a new one.
+unsafe extern "C" fn touch_resume(rdpei: *mut sys::RdpeiClientContext) -> u32 {
+    guarded("rdpei ResumeTouch", sys::ERROR_INTERNAL_ERROR, || {
+        // SAFETY: as above.
+        if let Some(bridge) = unsafe { rdpei_bridge(rdpei) } {
+            bridge.touch_suspended = false;
+        }
+        sys::CHANNEL_RC_OK
     })
 }
 
@@ -2374,6 +2596,200 @@ unsafe fn respond_with(cliprdr: *mut sys::CliprdrClientContext, data: Option<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// What the stand-in plugin below was handed, in order.
+        static TOUCH_CALLS: RefCell<Vec<(TouchPhase, i32, i32, i32)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    fn record(phase: TouchPhase, id: i32, x: i32, y: i32) -> u32 {
+        TOUCH_CALLS.with(|calls| calls.borrow_mut().push((phase, id, x, y)));
+        sys::CHANNEL_RC_OK
+    }
+
+    fn touch_calls() -> Vec<(TouchPhase, i32, i32, i32)> {
+        TOUCH_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()))
+    }
+
+    unsafe extern "C" fn fake_touch_begin(
+        _: *mut sys::RdpeiClientContext,
+        id: i32,
+        x: i32,
+        y: i32,
+        _: *mut i32,
+    ) -> u32 {
+        record(TouchPhase::Down, id, x, y)
+    }
+
+    unsafe extern "C" fn fake_touch_update(
+        _: *mut sys::RdpeiClientContext,
+        id: i32,
+        x: i32,
+        y: i32,
+        _: *mut i32,
+    ) -> u32 {
+        record(TouchPhase::Move, id, x, y)
+    }
+
+    unsafe extern "C" fn fake_touch_end(
+        _: *mut sys::RdpeiClientContext,
+        id: i32,
+        x: i32,
+        y: i32,
+        _: *mut i32,
+    ) -> u32 {
+        record(TouchPhase::Up, id, x, y)
+    }
+
+    unsafe extern "C" fn fake_touch_cancel(
+        _: *mut sys::RdpeiClientContext,
+        id: i32,
+        x: i32,
+        y: i32,
+        _: *mut i32,
+    ) -> u32 {
+        record(TouchPhase::Cancel, id, x, y)
+    }
+
+    /// A bridge, a wrapper context pointing at it, and a stand-in for the plugin's context whose
+    /// entry points record what reaches them — the three things `send_touch`, `touch_suspend`
+    /// and `touch_resume` walk between. Boxed so the pointers between them stay put.
+    struct TouchRig {
+        wrapper: Box<WrapperContext>,
+        rdpei: Box<sys::RdpeiClientContext>,
+        _bridge: Box<Bridge>,
+        _events: Receiver<Event>,
+    }
+
+    impl TouchRig {
+        fn new() -> Self {
+            let (events, receiver) = std::sync::mpsc::channel();
+            let mut bridge = Box::new(Bridge {
+                events,
+                shared: Arc::new(Shared::new()),
+                audio: None,
+                camera: None,
+                microphone: None,
+                audio_device: std::ptr::null_mut(),
+                cliprdr: std::ptr::null_mut(),
+                clipboard_ready: false,
+                pending_advertise: None,
+                disp: std::ptr::null_mut(),
+                resize_ready: false,
+                rdpei: std::ptr::null_mut(),
+                held_touches: HashMap::new(),
+                touch_suspended: false,
+                pending_resize: None,
+                audio_devices_seen: 0,
+                audio_dynamic_negotiated: false,
+                pending_reconnect: None,
+            });
+            // SAFETY: `rdpClientContext` is a C struct of pointers and integers, and the bridge
+            // pointer beside it is set below; all-zero is a valid value of every field.
+            let mut wrapper: Box<WrapperContext> = Box::new(unsafe { std::mem::zeroed() });
+            wrapper.bridge = &mut *bridge;
+            // SAFETY: pointers, `Option` function pointers (zero is `None`) and one integer.
+            let mut rdpei: Box<sys::RdpeiClientContext> = Box::new(unsafe { std::mem::zeroed() });
+            rdpei.custom = &mut *wrapper as *mut WrapperContext as *mut c_void;
+            rdpei.TouchBegin = Some(fake_touch_begin);
+            rdpei.TouchUpdate = Some(fake_touch_update);
+            rdpei.TouchEnd = Some(fake_touch_end);
+            rdpei.TouchCancel = Some(fake_touch_cancel);
+            bridge.rdpei = &mut *rdpei;
+            Self { wrapper, rdpei, _bridge: bridge, _events: receiver }
+        }
+
+        fn ctx(&mut self) -> *mut sys::rdpContext {
+            &mut *self.wrapper as *mut WrapperContext as *mut sys::rdpContext
+        }
+
+        fn rdpei(&mut self) -> *mut sys::RdpeiClientContext {
+            &mut *self.rdpei
+        }
+
+        fn touch(&mut self, phase: TouchPhase, id: i32, x: i32, y: i32) {
+            // SAFETY: the rig's context is live and its bridge set.
+            unsafe { send_touch(self.ctx(), phase, id, x, y) }
+        }
+
+        fn held(&mut self) -> Vec<i32> {
+            // SAFETY: as above.
+            let bridge = unsafe { bridge(self.ctx()) }.expect("the rig's bridge");
+            let mut held: Vec<i32> = bridge.held_touches.keys().copied().collect();
+            held.sort_unstable();
+            held
+        }
+    }
+
+    /// What the host's `SUSPEND_TOUCH` has to mean on this side, in the order it has to happen.
+    ///
+    /// This is not a wire test — there is no MS-RDPEI server in this repository to speak to, and
+    /// the PDUs themselves are the plugin's to parse. It drives the two callbacks the plugin
+    /// calls *from* those PDUs, against a stand-in for the plugin's own interface, and asserts
+    /// what reaches that interface: the cancels for what was down, at the positions it was last
+    /// seen, and then nothing at all until the resume.
+    #[test]
+    fn a_suspend_cancels_what_is_down_and_silences_the_rest_until_the_resume() {
+        use TouchPhase::{Cancel, Down, Move, Up};
+        let mut rig = TouchRig::new();
+        let _ = touch_calls();
+
+        rig.touch(Down, 7, 10, 20);
+        rig.touch(Move, 7, 11, 21);
+        rig.touch(Down, 8, 30, 40);
+        rig.touch(Up, 8, 30, 40);
+        assert_eq!(
+            touch_calls(),
+            vec![(Down, 7, 10, 20), (Move, 7, 11, 21), (Down, 8, 30, 40), (Up, 8, 30, 40)]
+        );
+        assert_eq!(rig.held(), vec![7]);
+
+        // The one finger still down is cancelled where it last was, and the table is emptied.
+        // SAFETY: the rig's plugin context is live and its `custom` set.
+        assert_eq!(unsafe { touch_suspend(rig.rdpei()) }, sys::CHANNEL_RC_OK);
+        assert_eq!(touch_calls(), vec![(Cancel, 7, 11, 21)]);
+        assert!(rig.held().is_empty());
+
+        // Nothing else reaches the plugin: not the up that finger would have had, not a new one.
+        rig.touch(Up, 7, 12, 22);
+        rig.touch(Down, 9, 1, 1);
+        rig.touch(Move, 9, 2, 2);
+        rig.touch(Up, 9, 3, 3);
+        assert!(touch_calls().is_empty());
+        assert!(rig.held().is_empty());
+
+        // SAFETY: as above.
+        assert_eq!(unsafe { touch_resume(rig.rdpei()) }, sys::CHANNEL_RC_OK);
+        rig.touch(Down, 9, 4, 4);
+        assert_eq!(touch_calls(), vec![(Down, 9, 4, 4)]);
+        rig.touch(Up, 9, 4, 4);
+        assert_eq!(touch_calls(), vec![(Up, 9, 4, 4)]);
+
+        // And a suspend with nothing down cancels nothing.
+        // SAFETY: as above.
+        assert_eq!(unsafe { touch_suspend(rig.rdpei()) }, sys::CHANNEL_RC_OK);
+        assert!(touch_calls().is_empty());
+    }
+
+    /// A `Move` on an id the plugin never saw begin does not start tracking it, so a later
+    /// suspend does not cancel a contact that was never down.
+    #[test]
+    fn a_move_without_a_down_is_not_a_contact_to_cancel() {
+        use TouchPhase::{Move, Up};
+        let mut rig = TouchRig::new();
+        let _ = touch_calls();
+        rig.touch(Move, 3, 5, 5);
+        rig.touch(Up, 4, 6, 6);
+        // Handed on — the plugin is the one that knows it has no slot for them —
+        assert_eq!(touch_calls(), vec![(Move, 3, 5, 5), (Up, 4, 6, 6)]);
+        // — but not remembered.
+        assert!(rig.held().is_empty());
+        // SAFETY: the rig's plugin context is live and its `custom` set.
+        assert_eq!(unsafe { touch_suspend(rig.rdpei()) }, sys::CHANNEL_RC_OK);
+        assert!(touch_calls().is_empty());
+    }
 
     /// The layout promise the whole callback design rests on.
     ///
