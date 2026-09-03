@@ -54,6 +54,15 @@
 // `target_vendor` rather than `target_os`, so iOS and the simulator select the Apple ABI too —
 // there are no archives for them, but the wrong bindings would be a worse error message than the
 // one `build.rs` gives.
+//
+// **A third file on Windows, for a different reason.** There `BOOL` is the SDK's `int`, the same
+// four bytes as Linux — but `winpr/wtypes.h` includes `<windows.h>` instead of defining the types
+// itself, and `synch.h`, `handle.h` and `error.h` each hand their declarations over to
+// the SDK under `#ifndef _WIN32`. `--allowlist-file` keeps the SDK out of the generated file, so
+// the platform names the wrapper calls (`CreateEventA`, `WaitForMultipleObjects`, `ERROR_INTERNAL_ERROR`)
+// come from the hand-written `win32.rs` beside it instead. Layout is not the same either: the
+// MSVC ABI packs bitfields and lays out unions by its own rules, and the layout tests bindgen
+// emits are computed on the generating machine, so the file has to be generated *on* Windows.
 // **`unnecessary_transmutes` is a rustc lint, not a clippy one**, so the `#![allow(clippy::all)]`
 // bindgen writes into each generated file does not cover it and `-D warnings` turns it into a
 // failed build. It fires in `bindings_linux.rs` and *not* in `bindings_apple.rs`, which is the
@@ -64,10 +73,16 @@
 // warning — this crate's MSRV is older than the lint.
 #[allow(unknown_lints, unnecessary_transmutes)]
 #[cfg_attr(target_vendor = "apple", path = "bindings_apple.rs")]
-#[cfg_attr(not(target_vendor = "apple"), path = "bindings_linux.rs")]
+#[cfg_attr(windows, path = "bindings_windows.rs")]
+#[cfg_attr(not(any(target_vendor = "apple", windows)), path = "bindings_linux.rs")]
 mod bindings;
 
+#[cfg(windows)]
+mod win32;
+
 pub use bindings::*;
+#[cfg(windows)]
+pub use win32::*;
 
 /// What the linked FreeRDP says it is, e.g. `3.30.0`.
 ///

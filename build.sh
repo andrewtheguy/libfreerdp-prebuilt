@@ -9,6 +9,9 @@
 #   macos-arm64      Apple silicon, deployment target from freerdp.env
 #   linux-x86_64     x86-64 baseline
 #   linux-aarch64    ARMv8-A baseline
+#   windows-x86_64-msvc
+#                    x86-64 baseline, MSVC, dynamic CRT — from MSYS2 bash inside a Visual Studio
+#                    developer shell (see below)
 #
 # Output: dist/<target>/{lib,include}/… plus a MANIFEST naming both versions, both checksums, the
 # full configure lines, the link order, and — measured rather than assumed — which system
@@ -20,9 +23,16 @@
 # thing this repository exists to avoid: building it once, with FreeRDP's own build system, is
 # exactly what frees every *consumer* from needing cmake, pkg-config, a C toolchain or OpenSSL.
 #
-# No Windows target. FreeRDP builds fine on MSVC, but no consumer of this repository targets it
-# and the OpenSSL half would need its own toolchain setup. Adding one is real work rather than a
-# line in the case statement below.
+# **Windows is MSVC, and it is the one target that is not a line in the case statement.** The
+# OpenSSL half builds with `nmake` from a native (Strawberry) perl, FreeRDP with Ninja and `cl`,
+# and the measurements below read COFF archives with LLVM's tools where the others use binutils.
+# What stays the same is the shape: build both with their own build systems, then measure the
+# result rather than describe it. The run needs MSYS2 bash (this script, `comm`, `awk`), a Visual
+# Studio developer shell around it (`cl`, `link`, `nmake`, and `LIB`/`INCLUDE` for the SDK), nasm,
+# a native perl, Ninja, and `llvm-nm`/`llvm-readobj`/`llvm-ar` on PATH. The archives are compiled
+# against the dynamic CRT, because that is what Rust's `-msvc` target links, and OpenSSL's static
+# libraries are `/Zl` — they name no CRT at all and take the consumer's — both asserted on the
+# finished archives rather than trusted from the flags.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +58,7 @@ ssl_prefix="$work/openssl"
 # machine-dependent link this repository exists to prevent.
 ignore_prefixes='/opt/homebrew;/usr/local;/home/linuxbrew/.linuxbrew'
 
+windows=''
 case "$target" in
   macos-arm64)
     openssl_target=darwin64-arm64-cc
@@ -65,20 +76,88 @@ case "$target" in
     openssl_target=linux-aarch64
     cpu_floor='armv8-a (NEON is mandatory in ARMv8-A)'
     ;;
+  windows-x86_64-msvc)
+    openssl_target=VC-WIN64A
+    windows=1
+    # Same reasoning as linux-x86_64: the primitives pick a kernel from cpuid at run time, so a
+    # floor decides nothing the archive needs decided. MSVC's default is the x86-64 baseline.
+    cpu_floor='x86-64 baseline (runtime CPU detection for the SSE/AVX primitives)'
+    ;;
   *)
     echo "unknown target: $target" >&2
     exit 1
     ;;
 esac
 
+# A path as the native tool it is handed to will read it. Under MSYS2 that is `C:/…` — forward
+# slashes, which cl, cmake, nmake and perl all accept and which MSYS2's argument conversion leaves
+# alone — and everywhere else it is the path itself.
+np() { if [ -n "$windows" ]; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
+
+if [ -n "$windows" ]; then
+  case "$(uname -s)" in
+    MINGW* | MSYS*) ;;
+    *)
+      echo "$target is built from MSYS2 bash on a Windows machine, not from $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+  # The developer shell, recognised by the variables it sets rather than by which shell this is.
+  # `LIB` is what `link` and `nmake` search, and it is also where the measurement below finds the
+  # SDK's import libraries; `INCLUDE` is where cl finds <windows.h>.
+  if [ -z "${LIB:-}" ] || [ -z "${INCLUDE:-}" ]; then
+    echo "LIB and INCLUDE are not set — run this inside a Visual Studio developer shell" >&2
+    echo "  (vcvars64.bat, or ilammy/msvc-dev-cmd on a runner) so cl, link and the SDK are found." >&2
+    exit 1
+  fi
+  for tool in cl nmake nasm ninja cmake llvm-nm llvm-readobj llvm-ar cygpath; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "$tool is not on PATH" >&2
+      exit 1
+    }
+  done
+  # `link` is MSVC's linker *and* coreutils' hard-link tool, and MSYS2 puts /usr/bin first — so
+  # the linker is taken from beside cl rather than from PATH.
+  msvc_link="$(dirname "$(command -v cl)")/link.exe"
+  [ -x "$msvc_link" ] || {
+    echo "no link.exe beside $(command -v cl)" >&2
+    exit 1
+  }
+  # OpenSSL's Configure on VC-WIN64A needs a *native* perl: MSYS2's is a Cygwin build whose
+  # paths and `$^O` the generated nmake makefile does not understand. Strawberry Perl, or
+  # whatever OPENSSL_PERL names.
+  native_perl=''
+  for candidate in "${OPENSSL_PERL:-}" /c/Strawberry/perl/bin/perl.exe perl; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if [ "$("$candidate" -e 'print $^O' 2>/dev/null)" = MSWin32 ]; then
+      native_perl="$candidate"
+      break
+    fi
+  done
+  [ -n "$native_perl" ] || {
+    echo "no native (MSWin32) perl found for OpenSSL's Configure — install Strawberry Perl or" >&2
+    echo "  set OPENSSL_PERL to one" >&2
+    exit 1
+  }
+  # Where a Windows machine keeps OpenSSLs this build must not find: the Win64 installer's,
+  # Strawberry's own C toolchain (it ships one), MSYS2's, vcpkg's.
+  ignore_prefixes='C:/Program Files/OpenSSL;C:/Program Files/OpenSSL-Win64;C:/Strawberry/c;C:/msys64/usr;C:/msys64/mingw64;C:/msys64/clang64;C:/vcpkg'
+  cl_banner="$(cl 2>&1 | head -1 | tr -d '\r' || true)"
+  echo ">> toolchain: $cl_banner; nasm $(nasm -v | awk '{print $3}'); ninja $(ninja --version); perl $("$native_perl" -e 'print $^V')"
+fi
+
 # The archive container. GNU ar's `D` zeroes the member mtimes and uids that otherwise make two
 # builds of identical objects differ; Apple's ar has no equivalent, so macOS is not
 # byte-reproducible and the CI job that asserts reproducibility builds linux-x86_64 only. Stated
 # rather than papered over. FreeRDP compiles no `__DATE__` or `__TIME__` anywhere (checked), so
 # the container is the only source of nondeterminism there is to remove.
+#
+# Windows is the other one: lib.exe takes neither flag, and MSVC objects carry PDB references and
+# timestamps of their own. Like macOS, not asserted reproducible.
 cmake_ar_flags=()
 openssl_ar_flags=()
-if [ "$target" != "macos-arm64" ]; then
+if [ "$target" != "macos-arm64" ] && [ -z "$windows" ]; then
   # `CMAKE_C_ARCHIVE_APPEND` is deliberately *not* set alongside these two. cmake only generates
   # an append rule when it needs one — a single-shot `ar qc` covers every archive here — so
   # setting it makes it a variable the project never reads, and the configure-time
@@ -120,10 +199,28 @@ ssl_src="$here/build/openssl-${OPENSSL_VERSION}"
 # The verification below asserts MD4 and RC4 are in the finished libcrypto for that reason.
 openssl_args=(
   no-shared no-dso no-module no-engine no-tests no-apps no-docs
-  --prefix="$ssl_prefix" --libdir=lib
-  -fPIC
+  --prefix="$(np "$ssl_prefix")" --libdir=lib
 )
+# `-fPIC` for the toolchains that need telling; cl has no such flag and warns on it. On Windows
+# `no-shared` is also what makes OpenSSL compile its static libraries `/MT /Zl`
+# (Configurations/10-main.conf): `/Zl` omits the default-library directive from every object, so
+# the archives name *no* CRT, and their `malloc`-style references resolve against whichever CRT the
+# final link brings — Rust's `msvcrt.lib`, the dynamic one. That is OpenSSL's stated design for
+# its static libraries, and it is asserted on the archives below rather than taken from here.
+[ -z "$windows" ] && openssl_args+=(-fPIC)
 [ "$target" = "macos-arm64" ] && openssl_args+=("-mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET")
+
+# What OpenSSL installs, and what the archives are called once collected. The same off Windows;
+# there `libssl.lib` becomes `ssl.lib`, because rustc resolves `static=ssl` on MSVC as `ssl.lib`
+# and never as `libssl.lib` — so the MANIFEST's link_order, and build.rs, read the same on every
+# target.
+if [ -n "$windows" ]; then
+  ssl_built=(libssl.lib libcrypto.lib)
+  ssl_archives=(ssl.lib crypto.lib)
+else
+  ssl_built=(libssl.a libcrypto.a)
+  ssl_archives=(libssl.a libcrypto.a)
+fi
 
 # **The one thing in this build that was not reproducible**, and it was CI that said so rather
 # than anybody predicting it: `util/mkbuildinf.pl` writes `#define DATE "built on: <now>"` into
@@ -143,16 +240,28 @@ mkdir -p "$work/openssl-build"
   cd "$work/openssl-build"
   # Out-of-tree, so two targets built on one machine cannot contaminate each other's object files
   # — OpenSSL's in-tree build leaves them in the source directory.
-  "$ssl_src/Configure" "$openssl_target" "${openssl_args[@]}" "${openssl_ar_flags[@]+"${openssl_ar_flags[@]}"}"
+  if [ -n "$windows" ]; then
+    MSYS2_ARG_CONV_EXCL='*' "$native_perl" "$(np "$ssl_src/Configure")" "$openssl_target" "${openssl_args[@]}"
+  else
+    "$ssl_src/Configure" "$openssl_target" "${openssl_args[@]}" "${openssl_ar_flags[@]+"${openssl_ar_flags[@]}"}"
+  fi
 )
+# JOBS caps the parallelism for a machine with less memory than cores; nmake has none to cap.
+jobs="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 echo ">> building OpenSSL"
-make -C "$work/openssl-build" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" build_libs >/dev/null
 # `install_dev` rather than `install`: the headers, the two archives and nothing else. Plain
 # `install` also writes man pages, `misc/` scripts and a `certs/` tree, none of which belongs in
 # a relocatable prefix that exists to be linked against.
-make -C "$work/openssl-build" install_dev >/dev/null
+if [ -n "$windows" ]; then
+  # `-nologo` rather than `/nologo`, so MSYS2 does not read the option as a path to convert.
+  (cd "$work/openssl-build" && nmake -nologo build_libs >/dev/null)
+  (cd "$work/openssl-build" && nmake -nologo install_dev >/dev/null)
+else
+  make -C "$work/openssl-build" -j"$jobs" build_libs >/dev/null
+  make -C "$work/openssl-build" install_dev >/dev/null
+fi
 
-for archive in libssl.a libcrypto.a; do
+for archive in "${ssl_built[@]}"; do
   [ -f "$ssl_prefix/lib/$archive" ] || {
     echo "OpenSSL did not install $archive into $ssl_prefix/lib" >&2
     exit 1
@@ -163,12 +272,12 @@ done
 # job runs on one target and builds twice, so it costs ten minutes to tell us what one grep can,
 # and it does not run at all on the two targets it does not cover.
 epoch_date="built on: $(LC_ALL=C TZ=UTC perl -e 'print scalar gmtime(0)') UTC"
-if ! LC_ALL=C grep -aqF "$epoch_date" "$ssl_prefix/lib/libcrypto.a"; then
-  echo "libcrypto.a does not carry the fixed build date, so this build is not reproducible:" >&2
-  LC_ALL=C grep -aoE 'built on: [^"]*' "$ssl_prefix/lib/libcrypto.a" | head -1 >&2
+if ! LC_ALL=C grep -aqF "$epoch_date" "$ssl_prefix/lib/${ssl_built[1]}"; then
+  echo "${ssl_built[1]} does not carry the fixed build date, so this build is not reproducible:" >&2
+  LC_ALL=C grep -aoE 'built on: [^"]*' "$ssl_prefix/lib/${ssl_built[1]}" | head -1 >&2
   exit 1
 fi
-echo "   $ssl_prefix/lib/{libssl,libcrypto}.a"
+echo "   $ssl_prefix/lib/{${ssl_built[0]},${ssl_built[1]}}"
 
 # ---------------------------------------------------------------- FreeRDP
 
@@ -204,7 +313,7 @@ rdp_src="$here/build/freerdp-${FREERDP_VERSION}"
 # release. Static linking is per-object: a binary that never calls them pulls in nothing.
 cmake_args=(
   -DCMAKE_BUILD_TYPE=Release
-  -DCMAKE_INSTALL_PREFIX="$work/prefix"
+  -DCMAKE_INSTALL_PREFIX="$(np "$work/prefix")"
   -DBUILD_SHARED_LIBS=OFF
   -DBUILD_TESTING=OFF
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -254,7 +363,7 @@ cmake_args=(
   # one — the same duplicate-symbol hazard as zlib, and both are asserted against below.
   -DWITH_OPUS=OFF
 
-  -DOPENSSL_ROOT_DIR="$ssl_prefix"
+  -DOPENSSL_ROOT_DIR="$(np "$ssl_prefix")"
   -DOPENSSL_USE_STATIC_LIBS=ON
   -DCMAKE_IGNORE_PREFIX_PATH="$ignore_prefixes"
   -DWITH_MBEDTLS=OFF
@@ -286,12 +395,44 @@ done
 
 [ "$target" = "macos-arm64" ] && cmake_args+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOS_DEPLOYMENT_TARGET")
 
+if [ -n "$windows" ]; then
+  # Everything above stays on the list, the Linux-only entries included. `CMakeLists.txt` reads
+  # every `WITH_*` variable into `buildflags.h` (its FREERDP_BUILD_CONFIG loop), so none of them
+  # is ever "unused" on any platform, the assertion below could not tell a Windows-ignored one
+  # from a read one, and an identical array keeps the MANIFESTs comparable. What Windows adds:
+  cmake_args+=(
+    # The dynamic CRT, `/MD` — what Rust's `-msvc` target links, and what libopus-prebuilt and
+    # libvpx-prebuilt are built against. Asserted on the archives' directives below.
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+    # Defaults ON on WIN32: a winmm `rdpsnd`/`audin` backend beside the consumer's own, and
+    # `winmm.lib` on every consumer's link line for it.
+    -DWITH_WINMM=OFF
+    # Defaults ON on WIN32: NTLM and CredSSP through secur32 loaded at run time, instead of the
+    # WinPR path over the OpenSSL built above — the one the MD4/RC4 assertions and every other
+    # target cover.
+    -DWITH_NATIVE_SSPI=OFF
+    -DWITH_WIN8=OFF -DWITH_MEDIA_FOUNDATION=OFF
+    # `_WIN32_WINNT=0x0601`, FreeRDP's own default, spelled out because gen-bindings.sh compiles
+    # the same headers with the same value and the two must not drift apart.
+    -DCMAKE_WINDOWS_VERSION=WIN7
+  )
+fi
+
 generator=(-G "Unix Makefiles")
 command -v ninja >/dev/null 2>&1 && generator=(-G Ninja)
+if [ -n "$windows" ]; then
+  # Ninja, required rather than preferred. cmake's default on Windows is the Visual Studio
+  # generator, which ignores CMAKE_BUILD_TYPE and builds Debug — an `/MDd` archive nobody can link
+  # into a release binary, and one nothing above would notice. Ninja is single-configuration and
+  # takes the compiler from the developer shell; `CC=cl` says which, in case the MSYS2 PATH
+  # carries a gcc.
+  generator=(-G Ninja)
+  export CC=cl
+fi
 
 echo ">> configuring FreeRDP ${FREERDP_VERSION} for $target"
 configure_log="$work/cmake-configure.log"
-cmake -S "$rdp_src" -B "$work/cmake" "${generator[@]}" \
+cmake -S "$(np "$rdp_src")" -B "$(np "$work/cmake")" "${generator[@]}" \
   "${cmake_args[@]}" "${cmake_ar_flags[@]+"${cmake_ar_flags[@]}"}" 2>&1 | tee "$configure_log"
 
 # Two assertions on the configure output, and the first one is the most valuable line in this
@@ -305,7 +446,7 @@ if grep -q 'Manually-specified variables were not used by the project' "$configu
 fi
 # And that it found *our* OpenSSL. The check above cannot catch this one: OPENSSL_ROOT_DIR is
 # read, so it is never "unused" — it is simply outranked by anything find_package likes better.
-grep -qE "Found OpenSSL: .*${ssl_prefix}.* \(found version \"${OPENSSL_VERSION}\"\)" "$configure_log" || {
+grep -qE "Found OpenSSL: .*$(np "$ssl_prefix").* \(found version \"${OPENSSL_VERSION}\"\)" "$configure_log" || {
   echo "cmake did not find the OpenSSL ${OPENSSL_VERSION} built above:" >&2
   grep -i 'OpenSSL' "$configure_log" >&2 || true
   exit 1
@@ -313,8 +454,8 @@ grep -qE "Found OpenSSL: .*${ssl_prefix}.* \(found version \"${OPENSSL_VERSION}\
 echo "   OpenSSL ${OPENSSL_VERSION} from $ssl_prefix, and no ignored options"
 
 echo ">> building FreeRDP"
-cmake --build "$work/cmake" --parallel "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" >/dev/null
-cmake --install "$work/cmake" >/dev/null
+cmake --build "$(np "$work/cmake")" --parallel "$jobs" >/dev/null
+cmake --install "$(np "$work/cmake")" >/dev/null
 
 # ---------------------------------------------------------------- collect
 
@@ -327,15 +468,18 @@ cmake --install "$work/cmake" >/dev/null
 # `--start-group`: the client archive calls into the core, the core calls into WinPR, and all
 # three call into OpenSSL.
 archives=(libfreerdp-client3.a libfreerdp3.a libwinpr3.a)
-ssl_archives=(libssl.a libcrypto.a)
+# cmake's static-library prefix on Windows is empty, and rustc's `static=winpr3` there means
+# `winpr3.lib` — so FreeRDP's three keep the names cmake gave them, OpenSSL's two lose their
+# `lib` (see `ssl_archives`), and the link order is one string on every target.
+[ -n "$windows" ] && archives=(freerdp-client3.lib freerdp3.lib winpr3.lib)
 link_order='-lfreerdp-client3 -lfreerdp3 -lwinpr3 -lssl -lcrypto'
 
 mkdir -p "$out/lib"
 for archive in "${archives[@]}"; do
   cp "$work/prefix/lib/$archive" "$out/lib/$archive"
 done
-for archive in "${ssl_archives[@]}"; do
-  cp "$ssl_prefix/lib/$archive" "$out/lib/$archive"
+for i in 0 1; do
+  cp "$ssl_prefix/lib/${ssl_built[$i]}" "$out/lib/${ssl_archives[$i]}"
 done
 
 # The whole installed header tree, not a hand-picked list — and it has to be the *installed* one
@@ -391,8 +535,55 @@ case "$target" in
     done
     rm -rf "$probe_member"
     ;;
+  windows-*)
+    # COFF has no bitcode to worry about unless `/GL` is on — which IPO OFF prevents — but the
+    # same question is asked the same way: the first member of each archive must be an x86-64
+    # COFF object. `llvm-ar p` rather than `x`, because lib.exe names members by path and an
+    # extraction would want the directories.
+    probe_member="$(mktemp -d)"
+    for archive in "${archives[@]}"; do
+      listing="$(llvm-ar t "$out/lib/$archive")"
+      member="${listing%%$'\n'*}"
+      llvm-ar p "$out/lib/$archive" "$member" > "$probe_member/member.obj"
+      llvm-readobj --file-headers "$probe_member/member.obj" 2>/dev/null | grep -q 'Format: COFF-x86-64' || {
+        echo "$archive's first member ($member) is not an x86-64 COFF object" >&2
+        rm -rf "$probe_member"
+        exit 1
+      }
+    done
+    rm -rf "$probe_member"
+    ;;
 esac
 echo "   real object code"
+
+if [ -n "$windows" ]; then
+  echo ">> verifying which CRT the archives name"
+  # `/DEFAULTLIB` directives, read off the objects — the one place the CRT choice is recorded. The
+  # three FreeRDP archives must name MSVCRT (the dynamic CRT, `/MD`) and no static or debug one;
+  # OpenSSL's two must name none at all, which is what `/Zl` means and what lets a `/MT`-configured
+  # OpenSSL link into an `/MD` binary. A LIBCMT or MSVCRTD here is a duplicate-CRT link error in
+  # every consumer, reported against a symbol nobody would connect to this file.
+  for archive in "${archives[@]}"; do
+    directives="$(llvm-readobj --coff-directives "$out/lib/$archive")"
+    grep -qiE 'DEFAULTLIB:"?MSVCRT"?( |$)' <<<"$directives" || {
+      echo "$archive names no MSVCRT default library — it was not compiled with /MD" >&2
+      exit 1
+    }
+    if grep -qiE 'DEFAULTLIB:"?(LIBCMT|LIBCMTD|MSVCRTD)"?( |$)' <<<"$directives"; then
+      echo "$archive names a static or debug CRT:" >&2
+      grep -ioE 'DEFAULTLIB:"?(LIBCMT|LIBCMTD|MSVCRTD)"?' <<<"$directives" | sort -u >&2
+      exit 1
+    fi
+  done
+  for archive in "${ssl_archives[@]}"; do
+    if llvm-readobj --coff-directives "$out/lib/$archive" | grep -qi 'DEFAULTLIB'; then
+      echo "$archive names a default library, so OpenSSL was not built /Zl and its CRT choice" >&2
+      echo "  would fight the consumer's" >&2
+      exit 1
+    fi
+  done
+  echo "   FreeRDP: MSVCRT (dynamic, /MD); OpenSSL: none (/Zl)"
+fi
 
 echo ">> verifying the entry points are in the archives"
 # The functions the wrapper crate actually calls, and the channel entry points that say the
@@ -402,9 +593,20 @@ echo ">> verifying the entry points are in the archives"
 # No `2>/dev/null || true` on the nm: an nm that cannot read an archive produces an empty symbol
 # list, and an empty symbol list makes every check below report a *missing* entry point — a
 # measurement failure wearing the costume of a build failure.
+#
+# `nm` on ELF and Mach-O, `llvm-nm` on COFF — minus the `member.obj:` header lines and blank
+# separators it prints per archive member, which would otherwise be read as symbols. x64 COFF
+# names carry no underscore prefix, so `[ _]name$` matches the same on every target.
+list_symbols() {
+  if [ -n "$windows" ]; then
+    llvm-nm "$1" "$2" | grep -v -e ':$' -e '^$'
+  else
+    nm "$1" "$2"
+  fi
+}
 symbols=''
 for archive in "${archives[@]}"; do
-  part="$(nm --defined-only "$out/lib/$archive")" || {
+  part="$(list_symbols --defined-only "$out/lib/$archive")" || {
     echo "nm could not read $out/lib/$archive — nothing below was measured" >&2
     exit 1
   }
@@ -478,13 +680,13 @@ echo ">> verifying OpenSSL kept the algorithms CredSSP needs"
 # `no-legacy` note above. An OpenSSL configured without it still links, still connects to a Linux
 # xrdp over TLS, and fails only against a Windows host doing NLA, which is the one case that
 # matters most and the one a CI job on a container image does not exercise.
-ssl_symbols="$(nm --defined-only "$out/lib/libcrypto.a")" || {
-  echo "nm could not read $out/lib/libcrypto.a — the provider check did not run" >&2
+ssl_symbols="$(list_symbols --defined-only "$out/lib/${ssl_archives[1]}")" || {
+  echo "nm could not read $out/lib/${ssl_archives[1]} — the provider check did not run" >&2
   exit 1
 }
 for symbol in ossl_md4_functions ossl_rc4128_functions; do
   grep -qE "[ _]$symbol$" <<<"$ssl_symbols" || {
-    echo "$symbol is not in libcrypto.a — the legacy provider was configured out, so NTLM" >&2
+    echo "$symbol is not in ${ssl_archives[1]} — the legacy provider was configured out, so NTLM" >&2
     echo "  (and therefore CredSSP, and therefore every Windows target) will not work." >&2
     exit 1
   }
@@ -500,7 +702,7 @@ echo ">> measuring the system dependencies"
 undefined=''
 defined=''
 for archive in "${archives[@]}" "${ssl_archives[@]}"; do
-  part="$(nm --undefined-only "$out/lib/$archive")" || {
+  part="$(list_symbols --undefined-only "$out/lib/$archive")" || {
     echo "nm could not read $out/lib/$archive — the requirements were not measured" >&2
     exit 1
   }
@@ -508,7 +710,7 @@ for archive in "${archives[@]}" "${ssl_archives[@]}"; do
   # OpenSSL's two archives as well as FreeRDP's three, which is why `$symbols` from the section
   # above is not reused: libssl calls into libcrypto for nearly everything, and without libcrypto
   # in the subtrahend every one of those references looks like a system dependency.
-  part="$(nm --defined-only "$out/lib/$archive")" || {
+  part="$(list_symbols --defined-only "$out/lib/$archive")" || {
     echo "nm could not read $out/lib/$archive — the requirements were not measured" >&2
     exit 1
   }
@@ -574,10 +776,66 @@ case "$target" in
     matches '^pthread_' && system_libs+=(pthread)
     matches '^(shm_open|shm_unlink|timer_create|timer_settime|aio_read)$' && system_libs+=(rt)
     ;;
+  windows-*)
+    # Import libraries, measured against the SDK's own rather than guessed from names. Every
+    # `__imp_Name` the archives reference is looked up in the import libraries a candidate list
+    # names — `llvm-nm` lists an import library's `__imp_` symbols like any archive's — and the
+    # first library defining it claims it. `kernel32` goes first because several exports appear
+    # in more than one library and kernel32's is the copy everything links anyway. The CRT's own
+    # (msvcrt, ucrt, vcruntime, oldnames) come last and are claimed but *not* recorded: MSVCRT is
+    # what the `/DEFAULTLIB` directive asserted above already brings to every consumer's link.
+    # Whatever is left unclaimed is printed and left to the probe link, which is the oracle.
+    sdk_lib_dirs=()
+    while IFS= read -r dir; do
+      [ -n "$dir" ] && sdk_lib_dirs+=("$(cygpath -u "$dir")")
+    done < <(tr ';' '\n' <<<"$LIB")
+    find_import_lib() {
+      local dir
+      for dir in "${sdk_lib_dirs[@]}"; do
+        [ -f "$dir/$1.lib" ] && {
+          printf '%s\n' "$dir/$1.lib"
+          return 0
+        }
+      done
+      return 1
+    }
+    # Both spellings. A call through the import table is `__imp_Name`; a call WinPR makes through
+    # its own declaration of an API — the NCrypt and Nt* families, SHGetKnownFolderPath — is a
+    # bare `Name`, and an import library defines both. uuid.lib is not an import library at all:
+    # it holds the `FOLDERID_*` GUIDs as plain data. Windows API names are capitalised, which is
+    # what separates them here from the lowercase CRT (already brought by `/DEFAULTLIB`).
+    # `__ImageBase` is defined by the linker itself and belongs to no library.
+    unclaimed="$(grep -E '^(__imp_)?[A-Z]' <<<"$external" | grep -vx '__ImageBase' || true)"
+    matched+='__ImageBase'$'\n'
+    for candidate in kernel32 user32 advapi32 ws2_32 crypt32 secur32 rpcrt4 shlwapi shell32 \
+      gdi32 ole32 credui cfgmgr32 dbghelp bcrypt ncrypt ntdll uuid iphlpapi setupapi winmm mpr \
+      netapi32 userenv version msvcrt ucrt vcruntime oldnames; do
+      [ -n "$unclaimed" ] || break
+      lib="$(find_import_lib "$candidate")" || continue
+      provided="$(llvm-nm --defined-only "$(np "$lib")" 2>/dev/null | tr -d '\r' | grep -v ':$' | awk 'NF > 1 {print $NF}' | sort -u)"
+      [ -n "$provided" ] || continue
+      claimed="$(comm -12 <(sort -u <<<"$unclaimed") <(printf '%s\n' "$provided"))"
+      [ -n "$claimed" ] || continue
+      matched+="$claimed"$'\n'
+      unclaimed="$(comm -23 <(sort -u <<<"$unclaimed") <(printf '%s\n' "$claimed"))"
+      case "$candidate" in
+        msvcrt | ucrt | vcruntime | oldnames) ;;
+        *) system_libs+=("$candidate") ;;
+      esac
+    done
+    if [ -n "$unclaimed" ]; then
+      echo "   imports no candidate import library claims (the probe link decides):"
+      while IFS= read -r line; do echo "     $line"; done <<<"$unclaimed"
+    fi
+    ;;
 esac
 
 cxx_runtime='none'
-if matches '^_?(_Zn[wa]|_Zd[la]|_ZN?St[0-9]|__cxa_(throw|begin_catch|allocate)|__gxx_personality)'; then
+# MSVC spells its C++ runtime differently: `??2@YAPEAX_K@Z` is operator new, and anything in
+# `@std@@` is the standard library.
+cxx_pattern='^_?(_Zn[wa]|_Zd[la]|_ZN?St[0-9]|__cxa_(throw|begin_catch|allocate)|__gxx_personality)'
+[ -n "$windows" ] && cxx_pattern='^(__imp_)?(\?\?[23]@YA|__CxxFrameHandler|_CxxThrowException|\?[^ ]*@std@@)'
+if matches "$cxx_pattern"; then
   echo "   cxx_runtime: required — something in this build pulled in C++" >&2
   echo "     (WITH_UNICODE_BUILTIN=OFF would do it, via ICU; so would a C++ codec.)" >&2
   echo "     Refused rather than recorded: a C++ runtime is a second dependency for every" >&2
@@ -644,7 +902,32 @@ for lib in ${system_libs[@]+"${system_libs[@]}"}; do probe_flags+=("-l$lib"); do
 for framework in ${frameworks[@]+"${frameworks[@]}"}; do probe_flags+=(-framework "$framework"); done
 [ "$target" = "macos-arm64" ] && probe_flags+=("-mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET")
 
-cc "${probe_flags[@]}" || {
+probe_exe="$work/probe"
+link_probe() {
+  [ -n "$windows" ] || {
+    cc "${probe_flags[@]}"
+    return
+  }
+  probe_exe="$work/probe.exe"
+  # `cl -c` and then `link` by hand rather than `cl` end to end: the cl driver would add its own
+  # default libraries (kernel32, user32, advapi32, …) to the link, and the point of the probe is
+  # to link against the measured set and nothing else. `-MD` so the probe names the same CRT the
+  # archives do. Conversion off, because every path here is already native.
+  local link_args=("$(np "$work/probe.obj")" "-libpath:$(np "$out/lib")" "${archives[@]}" "${ssl_archives[@]}")
+  local lib
+  for lib in ${system_libs[@]+"${system_libs[@]}"}; do link_args+=("$lib.lib"); done
+  # `-DFREERDP_EXPORTS`: freerdp/api.h marks every API `__declspec(dllimport)` on Windows unless
+  # that is defined — there is no static-library spelling — and a dllimport call wants the
+  # `__imp_` symbol a static archive does not have. WinPR's own header guards the same choice
+  # behind `WINPR_DLL`, which a static build leaves undefined. Every C consumer of these archives
+  # defines it likewise; the Rust bindings carry no storage class and need nothing.
+  MSYS2_ARG_CONV_EXCL='*' cl -nologo -c -MD -O2 -DWIN32_LEAN_AND_MEAN -DFREERDP_EXPORTS \
+    -I"$(np "$out/include/freerdp3")" -I"$(np "$out/include/winpr3")" \
+    -Fo"$(np "$work/probe.obj")" "$(np "$work/probe.c")" >/dev/null \
+    && MSYS2_ARG_CONV_EXCL='*' "$msvc_link" -nologo -out:"$(np "$probe_exe")" "${link_args[@]}"
+}
+
+link_probe || {
   echo "the probe did not link against the measured dependency set" >&2
   echo "  system_libs: ${system_libs[*]:-none}" >&2
   echo "  frameworks:  ${frameworks[*]:-none}" >&2
@@ -659,7 +942,7 @@ cc "${probe_flags[@]}" || {
   exit 1
 }
 
-probe_version="$("$work/probe")" || {
+probe_version="$("$probe_exe" | tr -d '\r')" || {
   echo "the probe linked but did not run cleanly" >&2
   exit 1
 }
@@ -673,10 +956,13 @@ echo "   probe reports: $probe_version"
 # check-static.sh asks of a consumer's binary, asked here first so a bad archive fails in the job
 # that built it.
 case "$(uname -s)" in
-  Darwin) probe_deps="$(otool -L "$work/probe" | tail -n +2)" ;;
-  *) probe_deps="$(ldd "$work/probe" 2>/dev/null || true)" ;;
+  Darwin) probe_deps="$(otool -L "$probe_exe" | tail -n +2)" ;;
+  MINGW* | MSYS*) probe_deps="$(llvm-readobj --coff-imports "$probe_exe" | sed -n 's/^ *Name: //p')" ;;
+  *) probe_deps="$(ldd "$probe_exe" 2>/dev/null || true)" ;;
 esac
-if dynamic="$(grep -iE 'libssl|libcrypto|libfreerdp|libwinpr' <<<"$probe_deps")" && [ -n "$dynamic" ]; then
+# `freerdp|winpr` rather than `libfreerdp|libwinpr`: a Windows DLL of either would be
+# `freerdp3.dll`, with no `lib`.
+if dynamic="$(grep -iE 'libssl|libcrypto|freerdp|winpr' <<<"$probe_deps")" && [ -n "$dynamic" ]; then
   echo "the probe has dynamic dependencies it should have linked statically:" >&2
   printf '  %s\n' "$dynamic" >&2
   exit 1
@@ -720,6 +1006,9 @@ echo ">> checksumming"
   echo "system_libs ${system_libs[*]:-none}"
   echo "frameworks ${frameworks[*]:-none}"
   echo "cxx_runtime $cxx_runtime"
+  # Which C runtime the archives were compiled against. Informational off Windows; on it, the
+  # measured answer to the question every MSVC consumer has to ask.
+  if [ -n "$windows" ]; then echo "crt msvcrt (dynamic, /MD; OpenSSL /Zl)"; else echo "crt libc"; fi
   echo "channels $channels"
   echo "cpu_floor $cpu_floor"
   echo "probe $probe_version"
@@ -731,6 +1020,10 @@ echo ">> checksumming"
 # MANIFEST is meant to be comparable between machines that built the same thing. Rewritten to a
 # placeholder rather than dropped, so the line still shows that they were passed.
 sed -i.bak "s#$here#\$REPO#g" "$out/MANIFEST" && rm -f "$out/MANIFEST.bak"
+if [ -n "$windows" ]; then
+  # The same paths again in their native spelling, which is how cmake was handed them.
+  sed -i.bak "s#$(np "$here")#\$REPO#g" "$out/MANIFEST" && rm -f "$out/MANIFEST.bak"
+fi
 
 echo ">> wrote $out"
 cat "$out/MANIFEST"

@@ -11,9 +11,10 @@
 #
 #   include/{freerdp3,winpr3}/   FreeRDP's and WinPR's public headers. Text, and reviewable —
 #                                the opposite of a committed `.a`.
-#   src/bindings_apple.rs        generated *from* those headers by gen-bindings.sh — two files
-#   src/bindings_linux.rs        rather than one because `BOOL` is a byte on Apple and four off
-#                                it, and each is generated and checked on its own platform.
+#   src/bindings_apple.rs        generated *from* those headers by gen-bindings.sh — three
+#   src/bindings_linux.rs        files rather than one because `BOOL` is a byte on Apple and
+#   src/bindings_windows.rs      four off it, and Windows takes it and the event API from the
+#                                SDK; each is generated and checked on its own platform.
 #
 # **The headers come from a built artifact, not from the source tarball**, and that is a real
 # divergence from libvpx-prebuilt, which copies straight out of its checkout.
@@ -62,7 +63,7 @@ crate=crates/freerdp-prebuilt-sys
 prebuilt="$crate/prebuilt"
 
 # Every target build.sh knows how to make.
-targets=(macos-arm64 linux-x86_64 linux-aarch64)
+targets=(macos-arm64 linux-x86_64 linux-aarch64 windows-x86_64-msvc)
 
 # The one whose installed headers are committed.
 #
@@ -95,10 +96,25 @@ drift_allow="header-drift.allow"
 #
 # Emitted relative to the include root, sorted, one per line. `-MM` rather than `-M` so system
 # headers stay out, which is the same distinction `--allowlist-file` draws in gen-bindings.sh.
+#
+# On Windows the compiler is clang told the MSVC target and the defines FreeRDP built with — the
+# same list gen-bindings.sh hands bindgen — so the headers take the `_WIN32` branches there, which
+# reach a different set: `winpr/windows.h` pulls the SDK in and `synch.h` stops declaring things.
+# `-MM` keeps the SDK out of the list the same way it keeps glibc out.
 reachable_headers() {
-  local root="$1"
-  cc -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
+  local root="$1" compiler=(cc)
+  case "$(uname -s)" in
+    MINGW* | MSYS*)
+      compiler=(
+        clang --target=x86_64-pc-windows-msvc
+        -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
+        -D_WINSOCK_DEPRECATED_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+      )
+      ;;
+  esac
+  "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
     | tr ' ' '\n' \
+    | tr -d '\r' \
     | sed -n "s#^$root/##p" \
     | sort -u
 }
@@ -213,12 +229,18 @@ case "${1:-}" in
         exit 1
       fi
 
+      # A header reachable only here and not on the canonical target — which the `_WIN32`
+      # branches can produce — is committed too; it is named in the allowlist file so that the
+      # committed tree stays what wrapper.h reaches *somewhere*, and the "nothing unread" check
+      # below knows to skip it.
       # And nothing committed that nothing reads. Only against the canonical target, because a
       # header reachable on Linux and not on Darwin is a real thing (`#ifdef __linux__` in
       # wrapper.h's transitive includes) and would make this fire on the wrong platform.
       if [ "$target" = "$canonical" ]; then
         extra=()
-        while IFS= read -r header; do extra+=("$header"); done < <(comm -13 \
+        while IFS= read -r header; do
+          grep -qxF "$header" "$drift_allow" 2>/dev/null || extra+=("$header")
+        done < <(comm -13 \
           <(printf '%s\n' "${wanted[@]}") \
           <(cd "$crate/include" && find . -name '*.h' | sed 's#^\./##' | sort))
         if [ "${#extra[@]}" -gt 0 ]; then

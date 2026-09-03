@@ -1906,7 +1906,10 @@ unsafe extern "C" fn surface_frame_marker(
         let Some(bridge) = (unsafe { bridge(ctx) }) else { return 0 };
         // SAFETY: as `frame_marker`; `update` and `settings` are live on a connected context.
         unsafe {
-            if (*marker).frameAction != sys::SURFCMD_FRAMEACTION_SURFACECMD_FRAMEACTION_END {
+            // `as u32`: the enum constant is `c_uint` from clang and `c_int` from MSVC; the
+            // field is a UINT32 on both.
+            #[allow(clippy::unnecessary_cast)]
+            if (*marker).frameAction != sys::SURFCMD_FRAMEACTION_SURFACECMD_FRAMEACTION_END as u32 {
                 return 1;
             }
             if sys::freerdp_settings_get_uint32(

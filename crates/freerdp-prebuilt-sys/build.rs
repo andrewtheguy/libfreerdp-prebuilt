@@ -149,7 +149,20 @@ impl Manifest {
     /// probe against exactly this set. `none` is a real answer — it is what macOS records, where
     /// libm, libdl and libpthread are all part of libSystem and Rust's own std already links it.
     fn system_libs(&self) -> Vec<String> {
-        self.list("system_libs", &["m", "dl", "pthread", "rt"])
+        let target = std::env::var("TARGET").unwrap_or_default();
+        // The Windows fallback is a superset of what build.sh has ever measured, because an
+        // import library the link does not need costs nothing, while a missing one is a page of
+        // `__imp_` symbols. Only the MANIFEST-less case reads it.
+        let fallback: &[&str] = if target.contains("windows") {
+            &[
+                "kernel32", "user32", "advapi32", "ws2_32", "crypt32", "secur32", "rpcrt4",
+                "shlwapi", "shell32", "gdi32", "ole32", "credui", "cfgmgr32", "dbghelp", "bcrypt",
+                "ncrypt", "iphlpapi", "setupapi",
+            ]
+        } else {
+            &["m", "dl", "pthread", "rt"]
+        };
+        self.list("system_libs", fallback)
     }
 
     /// macOS only, and empty everywhere else. WinPR reaches into CoreFoundation and Foundation
@@ -472,16 +485,24 @@ fn prebuilt_dir(target: &str) -> &'static str {
              binary misbehaves at run time rather than at link time. Add a musl target to \
              build.sh, or set FREERDP_PREBUILT_DIR."
         ),
+        // MSVC only. The archives are `.lib`s compiled against the dynamic CRT (`/MD`), which is
+        // what Rust's own `-msvc` target links; a `-gnu` toolchain would need MinGW-built
+        // archives and a MinGW OpenSSL, neither of which this repository makes.
+        "x86_64-pc-windows-msvc" => "windows-x86_64-msvc",
+        t if t.contains("windows-gnu") => panic!(
+            "no prebuilt FreeRDP for {t}: the Windows archives are MSVC `.lib`s built against \
+             the dynamic CRT, for x86_64-pc-windows-msvc. Use that target, or set \
+             FREERDP_PREBUILT_DIR to a prefix holding MinGW-built archives of your own."
+        ),
         t if t.contains("windows") => panic!(
-            "no prebuilt FreeRDP for {t}: this repository builds no Windows archives, and the \
-             OpenSSL half would need its own toolchain setup. Set FREERDP_PREBUILT_DIR to a \
-             prefix holding your own, or add the target to build.sh — which is real work, not a \
-             line in a case statement."
+            "no prebuilt FreeRDP for {t}: the one Windows artifact is x86_64-pc-windows-msvc. Set \
+             FREERDP_PREBUILT_DIR to a prefix holding your own archives, or add the target to \
+             build.sh."
         ),
         other => panic!(
             "no prebuilt FreeRDP for {other}. Supported: aarch64-apple-darwin, \
-             x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu. Set FREERDP_PREBUILT_DIR to a \
-             prefix holding your own archives for anything else."
+             x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc. Set \
+             FREERDP_PREBUILT_DIR to a prefix holding your own archives for anything else."
         ),
     }
 }

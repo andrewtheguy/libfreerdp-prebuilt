@@ -36,9 +36,11 @@ crates/freerdp/                  the safe wrapper: a headless RDP client
 crates/freerdp-e2e/              a consumer that connects to a real server, run on every target
 ```
 
-Targets: `macos-arm64`, `linux-x86_64`, `linux-aarch64`. **No Windows** — FreeRDP builds fine on
-MSVC, but the OpenSSL half would need its own toolchain setup and no consumer of this repository
-targets it. **No musl**, and that is a refusal rather than an oversight: WinPR reaches into
+Targets: `macos-arm64`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64-msvc`. The Windows
+archives are MSVC `.lib`s against the dynamic CRT (`/MD`), for `x86_64-pc-windows-msvc` only —
+built from MSYS2 bash inside a Visual Studio developer shell, with OpenSSL under `nmake` from a
+native perl and FreeRDP under Ninja; no `-gnu` archives. **No musl**, and that is a refusal
+rather than an oversight: WinPR reaches into
 `dlopen`, `getpwuid_r` and the NSS resolver, which is exactly where a glibc-built archive linked
 into a musl binary compiles and then misbehaves at run time.
 

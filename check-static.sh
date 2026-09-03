@@ -45,8 +45,21 @@ else
   fail=1
 fi
 
+# On Windows the import table, read with the LLVM tool where it is (the runner image, the CI
+# box) and dumpbin from a developer shell otherwise; the names are DLLs, so the patterns below
+# say `freerdp|winpr` without the `lib` an ELF or Mach-O name would carry.
 case "$(uname -s)" in
   Darwin) deps="$(otool -L "$bin" | tail -n +2 || true)" ;;
+  MINGW* | MSYS*)
+    if command -v llvm-readobj >/dev/null 2>&1; then
+      deps="$(llvm-readobj --coff-imports "$bin" | sed -n 's/^ *Name: //p' || true)"
+    elif command -v dumpbin >/dev/null 2>&1; then
+      deps="$(dumpbin -nologo -dependents "$bin" | tr -d '\r' || true)"
+    else
+      echo "   FAIL  neither llvm-readobj nor dumpbin is on PATH, so the import table was not read" >&2
+      exit 1
+    fi
+    ;;
   *)      deps="$(ldd "$bin" 2>/dev/null || true)" ;;
 esac
 
@@ -69,7 +82,7 @@ find_deps() {
 
 # One pattern covering all four, because they fail for the same reason and a binary that got any
 # of them dynamically got them from somewhere this repository did not pin.
-find_deps 'libfreerdp|libwinpr|libssl|libcrypto'
+find_deps 'freerdp|winpr|libssl|libcrypto'
 if dynamic="$matched" && [ -n "$dynamic" ]; then
   echo "   FAIL  dynamic dependency on a library this repository ships statically:" >&2
   printf '           %s\n' "$dynamic" >&2
@@ -91,7 +104,9 @@ if [ -n "$manifest" ]; then
   cxx_runtime="$(sed -n 's/^cxx_runtime //p' "$manifest")"
   echo "   note  $(basename "$(dirname "$manifest")") MANIFEST says cxx_runtime: ${cxx_runtime:-<absent>}"
   if [ "$cxx_runtime" = "none" ]; then
-    find_deps 'libstdc\+\+|libc\+\+'
+    # `msvcp140` is MSVC's C++ standard library; `vcruntime140` beside it is the *C* runtime
+    # every `/MD` binary imports and says nothing about C++.
+    find_deps 'libstdc\+\+|libc\+\+|msvcp[0-9]'
     if cxx_deps="$matched" && [ -n "$cxx_deps" ]; then
       echo "   FAIL  the archives need no C++ runtime, but the binary links one:" >&2
       printf '           %s\n' "$cxx_deps" >&2

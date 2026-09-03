@@ -19,7 +19,7 @@ on:
         description: "which targets to build and test"
         type: choice
         default: all
-        options: [all, x86_64, arm64]
+        options: [all, windows, x86_64, arm64]
   workflow_call:
     inputs:
       targets:
@@ -52,9 +52,10 @@ jobs:
           GROUP: ${{ inputs.targets || 'all' }}
         run: |
           all='[
-            {"target":"macos-arm64",   "runs-on":"macos-latest",    "group":"arm64"},
-            {"target":"linux-x86_64",  "runs-on":"ubuntu-24.04",    "group":"x86_64"},
-            {"target":"linux-aarch64", "runs-on":"ubuntu-24.04-arm","group":"arm64"}
+            {"target":"macos-arm64",         "runs-on":"macos-latest",    "group":"arm64"},
+            {"target":"linux-x86_64",        "runs-on":"ubuntu-24.04",    "group":"x86_64"},
+            {"target":"linux-aarch64",       "runs-on":"ubuntu-24.04-arm","group":"arm64"},
+            {"target":"windows-x86_64-msvc", "runs-on":"windows-latest",  "group":"windows"}
           ]'
           targets="$(jq -c --arg g "$GROUP" '[.[] | select($g == "all" or .group == $g)]' <<<"$all")"
           # An unknown group selects nothing, and nothing is not a smaller build — it is a build
@@ -63,7 +64,7 @@ jobs:
           # group that does not exist and publish archives that nothing had built. Named here,
           # while there is still a step to name it in.
           [ "$(jq 'length' <<<"$targets")" -gt 0 ] || {
-            echo "::error::targets: '$GROUP' matches no target — expected all, x86_64 or arm64"
+            echo "::error::targets: '$GROUP' matches no target — expected all, windows, x86_64 or arm64"
             exit 1
           }
           echo "$targets" | jq -r '.[].target' | sed 's/^/  /'
@@ -78,12 +79,18 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.targets) }}
     runs-on: ${{ matrix.runs-on }}
+    # Every `run:` under bash, on the Windows runner too — there it is Git's bash for the cargo
+    # steps and the MSYS2 shell set up below for build.sh, so one script covers every target.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
 
       # cmake and ninja on the *builder* only. Nothing a consumer of this repository does needs
       # either, which is the whole point — see the README's table.
       - name: Install the build tools
+        if: runner.os != 'Windows'
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update
@@ -92,7 +99,43 @@ jobs:
             brew install ninja
           fi
 
+      # Windows: a Visual Studio developer environment (cl, link, nmake, and the LIB/INCLUDE the
+      # measurement reads the SDK's import libraries through), exported into every later step;
+      # nasm for OpenSSL's assembly; Ninja for cmake, because the Visual Studio generator would
+      # build Debug; and MSYS2 for build.sh itself, with `path-type: inherit` so that shell sees
+      # the developer environment, cargo, Strawberry Perl and LLVM — all on the image already.
+      - name: Enter a VS developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install nasm
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - name: Install Ninja
+        if: runner.os == 'Windows'
+        run: choco install -y ninja
+      - name: Set up the MSYS2 shell
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: diffutils
+      - name: Show the Windows toolchain
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cl 2>&1 | head -1; nasm -v; ninja --version; cmake --version | head -1
+          /c/Strawberry/perl/bin/perl -v | sed -n 2p
+          llvm-nm --version | sed -n 2p
+
       - name: Build ${{ matrix.target }}
+        if: runner.os != 'Windows'
+        run: ./build.sh ${{ matrix.target }}
+      - name: Build ${{ matrix.target }} (MSYS2 shell)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
         run: ./build.sh ${{ matrix.target }}
 
       - name: Show what was built
@@ -121,22 +164,36 @@ jobs:
       # and torn down. With one it proves the rest — see the xrdp job below.
       - name: End to end — a real binary that links the archives
         run: |
-          ./target/release/freerdp-e2e
-          ./check-static.sh target/release/freerdp-e2e
+          bin=target/release/freerdp-e2e
+          [ -f "$bin" ] || bin="$bin.exe"
+          "$bin"
+          ./check-static.sh "$bin"
 
       # And that the committed headers are the ones this artifact's own `cmake --install`
       # produced, plus that bindgen still makes the committed bindings out of them.
       #
       # **Every target runs this, and that is the point.** `winpr/wtypes.h` makes `BOOL` a
-      # four-byte int32_t off Apple and a one-byte value on it, so there are two committed
-      # bindings files and each is only checkable on its own platform. Running this everywhere is
-      # what keeps both honest — and running it on *both* Linux architectures is what says
-      # `bindings_linux.rs` may be one file rather than two.
+      # four-byte int32_t off Apple and a one-byte value on it, and on Windows hands the type and
+      # the event API to the SDK, so there are three committed bindings files and each is only
+      # checkable on its own platform. Running this everywhere is what keeps all three honest —
+      # and running it on *both* Linux architectures is what says `bindings_linux.rs` may be one
+      # file rather than two. The Windows one runs in the MSYS2 shell, where the developer
+      # environment's INCLUDE tells clang where <windows.h> is.
       - name: The committed headers and bindings are what this build produces
+        if: runner.os != 'Windows'
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get install -y libclang-dev
           fi
+          rustup component add rustfmt
+          cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
+          ./sync-prebuilt.sh --check
+      - name: The committed headers and bindings are what this build produces (MSYS2 shell)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+        run: |
           rustup component add rustfmt
           cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
           ./sync-prebuilt.sh --check
