@@ -147,8 +147,12 @@ impl Input {
     ///
     /// Worth sending once after connecting: without it a session whose caps lock is on locally
     /// starts out disagreeing with the remote, and every subsequent keystroke is the wrong case.
+    // The cast is not unnecessary everywhere: bindgen types a C enum's constants `c_uint` where
+    // clang does (Linux, Apple) and `c_int` under MSVC, which types every enum `int`. The wire
+    // field is a UINT32 on all three.
+    #[allow(clippy::unnecessary_cast)]
     pub fn lock_keys(&self, scroll: bool, num: bool, caps: bool, kana: bool) {
-        let mut flags = 0;
+        let mut flags: u32 = 0;
         for (on, bit) in [
             (scroll, sys::KBD_SYNC_FLAGS_KBD_SYNC_SCROLL_LOCK),
             (num, sys::KBD_SYNC_FLAGS_KBD_SYNC_NUM_LOCK),
@@ -156,7 +160,7 @@ impl Input {
             (kana, sys::KBD_SYNC_FLAGS_KBD_SYNC_KANA_LOCK),
         ] {
             if on {
-                flags |= bit;
+                flags |= bit as u32;
             }
         }
         self.push(Command::LockKeys { flags });

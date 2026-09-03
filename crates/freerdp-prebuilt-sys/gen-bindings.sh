@@ -67,15 +67,60 @@ cd "$here"
 # install.
 BINDGEN_VERSION=0.72.1
 
+# **A third file for Windows**, and for a third reason. `winpr/wtypes.h` takes `BOOL`, `HANDLE` and
+# the rest from `<windows.h>` on `_WIN32` instead of defining them, and `synch.h`, `handle.h` and
+# `error.h` hand their declarations to the SDK under `#ifndef _WIN32` — so the file generated
+# there describes FreeRDP's API and none of the platform's, and the five functions and three
+# constants the wrapper crate calls come from the hand-written `src/win32.rs` instead.
+# (`wtsapi.h` does *not* step aside: its `CHANNEL_RC_*` codes are in every file.)
+# `assert_complete` refuses a Windows file that declares any of those names, because a duplicate
+# would be a compile error in lib.rs rather than a stale binding. The layout tests are the other
+# reason: bindgen computes them with the generating machine's clang, and MSVC's bitfield and union
+# layout rules are its own, so the file is generated on Windows (MSYS2 bash inside a Visual Studio
+# developer shell, for the SDK headers on `INCLUDE`) with clang told the target and the same
+# defines FreeRDP compiled with (`CMakeLists.txt`'s `if(WIN32)` block).
 case "$(uname -s)" in
   Darwin) platform=apple ;;
   Linux) platform=linux ;;
+  MINGW*|MSYS*|CYGWIN*) platform=windows ;;
   *)
     echo "this repository builds no archives for $(uname -s), so there are no bindings to make" >&2
     exit 1
     ;;
 esac
 out="src/bindings_${platform}.rs"
+
+# What clang is told beyond the include paths. Windows needs the target spelled out — bindgen's
+# libclang would otherwise parse the SDK headers as whatever `uname` looks like to it — and the
+# defines FreeRDP itself was compiled with, so the headers take the same `#if` branches the
+# archives did. `INCLUDE` from the developer shell is where clang finds `<windows.h>`; it honours
+# that variable on the MSVC target.
+clang_args=()
+config_includes=()
+if [ "$platform" = windows ]; then
+  [ -n "${INCLUDE:-}" ] || {
+    echo "INCLUDE is not set — run this inside a Visual Studio developer shell (vcvars64.bat)," >&2
+    echo "  which is where clang finds the Windows SDK headers <windows.h> needs." >&2
+    exit 1
+  }
+  clang_args=(
+    --target=x86_64-pc-windows-msvc
+    -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN
+    -D_CRT_SECURE_NO_WARNINGS -D_WINSOCK_DEPRECATED_NO_WARNINGS
+    -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+  )
+  # The six generated config headers (header-drift.allow) are the host's: the committed include/
+  # tree carries Linux's, whose winpr/config.h says `ssize_t` exists, and clang for the MSVC
+  # target then fails on the very first typedef. So this target's own build goes first on the
+  # include path — the drift check has already proved every other header identical.
+  win_include="prebuilt/windows-x86_64-msvc/include"
+  [ -f "$win_include/winpr3/winpr/config.h" ] || {
+    echo "$win_include has no winpr/config.h — run ./build.sh windows-x86_64-msvc and" >&2
+    echo "  ./sync-prebuilt.sh first; the Windows bindings need the Windows-configured headers." >&2
+    exit 1
+  }
+  config_includes=(-I "$win_include/freerdp3" -I "$win_include/winpr3")
+fi
 
 command -v bindgen >/dev/null 2>&1 || {
   echo "bindgen is not installed. cargo install bindgen-cli --version $BINDGEN_VERSION --locked" >&2
@@ -106,9 +151,16 @@ command -v rustfmt >/dev/null 2>&1 || {
 # every `CLIPRDR_*` struct; a list of prefixes long enough to cover them would silently stop
 # covering a renamed one. The file pattern says the same thing structurally: whatever FreeRDP and
 # WinPR declare in their own installed headers, and nothing the platform's libc declares.
-allowlist='.*/(freerdp3|winpr3)/.*'
+# Either separator, because clang on Windows reports the path of a nested include with the
+# separator it resolved it through, and the allowlist has to match the SDK's neighbours out
+# whichever way they were spelled.
+allowlist='.*[/\\](freerdp3|winpr3)[/\\].*'
 
-generate() {
+# The output is LF regardless of where it was made: on Windows rustfmt writes CRLF, and a
+# committed file with two line-ending conventions across three platforms would be one that
+# `--check` reports stale on whichever platform did not write it.
+generate() { generate_raw | tr -d '\r'; }
+generate_raw() {
   # Layout checks kept, deliberately — no `--no-layout-tests`, and it matters more here than in a
   # small codec. `rdpPointer`, `rdpUpdate` and `rdpInput` carry explicit `paddingA[16-7]`-style
   # arrays whose arithmetic *is* the ABI: FreeRDP reserves slots so that a later release can add
@@ -144,7 +196,11 @@ generate() {
   # `--rust-target` pinned for the same reason the bindgen version is, and it is the one flag
   # that decides this crate's MSRV: bindgen defaults to the newest Rust it knows about, and from
   # 1.82 it emits `unsafe extern "C" { … }` blocks which do not parse on an older compiler.
-  bindgen wrapper.h \
+  # `MSYS2_ARG_CONV_EXCL`: bindgen is a native Windows program, and MSYS2 rewrites arguments
+  # that look like POSIX paths on the way to one — a raw line of `//` arrived as `/`. Nothing
+  # here is an absolute path (the clang args are defines and a target), so conversion is off
+  # for the call; elsewhere the variable is unread.
+  MSYS2_ARG_CONV_EXCL='*' bindgen wrapper.h \
     --rust-target 1.81 \
     --allowlist-file "$allowlist" \
     --blocklist-function 'winpr_fopen' \
@@ -172,10 +228,11 @@ generate() {
     --raw-line "// @generated by gen-bindings.sh on $platform, from the FreeRDP $FREERDP_VERSION" \
     --raw-line "// headers in include/ — do not edit. Regenerate with bindgen $BINDGEN_VERSION." \
     --raw-line "//" \
-    --raw-line "// There is a second file beside this one for the other platform, and that is not" \
+    --raw-line "// There are two more files beside this one, one per platform, and that is not" \
     --raw-line "// duplication: winpr/wtypes.h makes \`BOOL\` a four-byte int32_t on Linux and a" \
-    --raw-line "// one-byte signed char on Apple, so one file cannot describe both ABIs. See the" \
-    --raw-line "// long note at the top of gen-bindings.sh." \
+    --raw-line "// one-byte signed char on Apple, and on Windows takes it from <windows.h> along" \
+    --raw-line "// with the event and handle API (supplied by win32.rs there), so one file cannot" \
+    --raw-line "// describe the three ABIs. See the long note at the top of gen-bindings.sh." \
     --raw-line "//" \
     --raw-line "// \`--allowlist-file\` restricts this to items declared by FreeRDP's and WinPR's" \
     --raw-line "// own installed headers. Without it the output also carries whatever the" \
@@ -206,7 +263,7 @@ generate() {
     --raw-line "// a struct passed by value; do not." \
     --raw-line "pub type pcRdpeiTouchRawEventVA = ::std::option::Option<unsafe extern \"C\" fn(context: *mut RdpeiClientContext, externalId: INT32, x: INT32, y: INT32, contactId: *mut INT32, contactFlags: UINT32, fieldFlags: UINT32, args: *mut ::std::os::raw::c_void) -> UINT>;" \
     --raw-line "pub type pcRdpeiPenRawEventVA = ::std::option::Option<unsafe extern \"C\" fn(context: *mut RdpeiClientContext, externalId: INT32, contactFlags: UINT32, fieldFlags: UINT32, x: INT32, y: INT32, args: *mut ::std::os::raw::c_void) -> UINT>;" \
-    -- -I include/freerdp3 -I include/winpr3
+    -- ${config_includes[@]+"${config_includes[@]}"} -I include/freerdp3 -I include/winpr3 ${clang_args[@]+"${clang_args[@]}"}
 }
 
 # Is what bindgen just wrote actually FreeRDP's API?
@@ -260,6 +317,28 @@ assert_complete() {
     echo "  so this is almost certainly rustfmt not having run." >&2
     return 1
   }
+  # On Windows, the names `src/win32.rs` supplies must *not* be here — the SDK declares them, the
+  # allowlist keeps the SDK out, and a WinPR that stopped stepping aside for it would put both
+  # declarations in one crate. And `WAVE_FORMAT_PCM` must be: `freerdp/codec/audio.h` defines it
+  # under `#ifndef`, which holds as long as `WIN32_LEAN_AND_MEAN` keeps `<mmsystem.h>` out.
+  if [ "$platform" = windows ]; then
+    if grep -nE 'pub (fn (CreateEventA|SetEvent|ResetEvent|CloseHandle|WaitForMultipleObjects)\b|const (INFINITE|WAIT_FAILED|ERROR_INTERNAL_ERROR):)' "$file" >&2; then
+      echo "the generated Windows bindings declare names src/win32.rs also declares (above)." >&2
+      echo "  WinPR used to leave these to the SDK on _WIN32; if it no longer does, drop them" >&2
+      echo "  from win32.rs rather than from here." >&2
+      return 1
+    fi
+    grep -q 'pub const CHANNEL_RC_OK:' "$file" || {
+      echo "the generated Windows bindings lack CHANNEL_RC_OK: winpr/wtsapi.h stopped defining" >&2
+      echo "  the channel codes on _WIN32. They would then belong in src/win32.rs." >&2
+      return 1
+    }
+    grep -q 'pub const WAVE_FORMAT_PCM' "$file" || {
+      echo "the generated Windows bindings lack WAVE_FORMAT_PCM, so <mmsystem.h> got in ahead" >&2
+      echo "  of freerdp/codec/audio.h's own define. Check WIN32_LEAN_AND_MEAN in clang_args." >&2
+      return 1
+    }
+  fi
 }
 
 if [ "${1:-}" = "--check" ]; then
@@ -278,9 +357,10 @@ if [ "${1:-}" = "--check" ]; then
     echo "$out matches the committed FreeRDP $FREERDP_VERSION headers"
     # Said out loud, because a green check here covers *one* platform. The other file is checked
     # by the other platform's CI job, and nothing on this machine can speak for it.
-    other=apple
-    [ "$platform" = apple ] && other=linux
-    echo "   note: src/bindings_${other}.rs is not checked here — that is the $other job's"
+    for other in apple linux windows; do
+      [ "$other" = "$platform" ] && continue
+      echo "   note: src/bindings_${other}.rs is not checked here — that is the $other job's"
+    done
     exit 0
   fi
   echo "$out is stale — run gen-bindings.sh on a $platform machine" >&2

@@ -138,7 +138,7 @@ jobs:
           # Named here rather than discovered, so that a target silently missing from the matrix
           # is a failed release instead of a release somebody links against six months later and
           # finds nothing for their platform.
-          expected="macos-arm64 linux-x86_64 linux-aarch64"
+          expected="macos-arm64 linux-x86_64 linux-aarch64 windows-x86_64-msvc"
           for target in $expected; do
             dir="artifacts/freerdp-$target"
             [ -f "$dir/MANIFEST" ] || {
@@ -223,17 +223,31 @@ jobs:
           bindings are committed, generated from the headers in \`include/\` and checked against
           them in CI on every target.
 
-          On Linux \`build.rs\` emits \`-lm -ldl -lpthread\`, and on macOS \`-framework\`
-          CoreFoundation, CoreServices and Carbon — in both cases because the build *measured*
-          the archives' undefined symbols and then proved the answer by linking a probe against
+          On Linux \`build.rs\` emits \`-lm -ldl -lpthread\`, on macOS \`-framework\`
+          CoreFoundation, CoreServices and Carbon, and on Windows the import libraries the
+          MANIFEST's \`system_libs\` line names — in every case because the build *measured* the
+          archives' undefined symbols and then proved the answer by linking a probe against
           exactly that set. \`cxx_runtime\` is \`none\` on every target.
 
-          ## Two bindings files, one per ABI
+          ## Windows
 
-          \`winpr/wtypes.h\` typedefs \`BOOL\` to \`int32_t\` off Apple and to a one-byte value on
-          it, so the same headers describe a different ABI on each platform — in the return type
-          of nearly every FreeRDP function. There are therefore two committed bindings files,
-          selected by \`cfg\`, each generated and checked on its own platform.
+          \`windows-x86_64-msvc\` is for \`x86_64-pc-windows-msvc\` only: \`.lib\` archives
+          compiled against the **dynamic CRT** (\`/MD\`, the one Rust's MSVC target links), with
+          OpenSSL's two built \`/Zl\` so they name no CRT of their own. Both are asserted on the
+          finished archives' \`/DEFAULTLIB\` directives. The archives are \`freerdp-client3.lib\`,
+          \`freerdp3.lib\`, \`winpr3.lib\`, \`ssl.lib\` and \`crypto.lib\` — OpenSSL's renamed
+          from \`libssl.lib\`/\`libcrypto.lib\`, because rustc resolves \`static=ssl\` as
+          \`ssl.lib\` on MSVC. No \`-gnu\` archives.
+
+          ## Three bindings files, one per ABI
+
+          \`winpr/wtypes.h\` typedefs \`BOOL\` to \`int32_t\` on Linux and to a one-byte value on
+          Apple, so the same headers describe a different ABI on each platform — in the return
+          type of nearly every FreeRDP function. On Windows it takes \`BOOL\`, \`HANDLE\` and the
+          event API from the SDK instead, which the allowlist keeps out of the generated file, so
+          the few platform names the wrapper calls come from a hand-written \`win32.rs\`. There are
+          therefore three committed bindings files, selected by \`cfg\`, each generated and
+          checked on its own platform.
 
           ## Checking what you downloaded
 
@@ -250,7 +264,8 @@ jobs:
           Those \`sha256(lib/…)\` lines are also the interesting ones to compare *between*
           releases. On \`linux-x86_64\` the pipeline builds twice and requires the two to match,
           so two releases of the same FreeRDP with the same flags list the same hashes. macOS is
-          not byte-reproducible — Apple's \`ar\` has no deterministic mode — and that is measured
+          not byte-reproducible — Apple's \`ar\` has no deterministic mode — and neither is
+          Windows, where MSVC objects carry PDB references and timestamps; both are measured
           rather than claimed either way.
 
           ## Licensing
