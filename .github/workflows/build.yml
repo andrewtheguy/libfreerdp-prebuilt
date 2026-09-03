@@ -188,15 +188,20 @@ jobs:
           rustup component add rustfmt
           cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
           ./sync-prebuilt.sh --check
+      # bindgen is installed from PowerShell, not the MSYS2 shell: there `/usr/bin/link`
+      # (coreutils) shadows MSVC's link.exe and every build script fails to link.
+      - name: Install bindgen (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup component add rustfmt
+          cargo install bindgen-cli --version "$env:BINDGEN_VERSION" --locked
       - name: The committed headers and bindings are what this build produces (MSYS2 shell)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         env:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
-        run: |
-          rustup component add rustfmt
-          cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
-          ./sync-prebuilt.sh --check
+        run: ./sync-prebuilt.sh --check
 
       - uses: actions/upload-artifact@v4
         with:

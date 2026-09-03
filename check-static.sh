@@ -47,14 +47,16 @@ fi
 
 # On Windows the import table, read with the LLVM tool where it is (the runner image, the CI
 # box) and dumpbin from a developer shell otherwise; the names are DLLs, so the patterns below
-# say `freerdp|winpr` without the `lib` an ELF or Mach-O name would carry.
+# say `freerdp|winpr` without the `lib` an ELF or Mach-O name would carry. No `|| true` on these
+# two: otool and ldd say "not dynamic" with a nonzero status, but a reader that could not open
+# the file must fail here (set -e, pipefail), not report a binary that imports nothing.
 case "$(uname -s)" in
   Darwin) deps="$(otool -L "$bin" | tail -n +2 || true)" ;;
   MINGW* | MSYS*)
     if command -v llvm-readobj >/dev/null 2>&1; then
-      deps="$(llvm-readobj --coff-imports "$bin" | sed -n 's/^ *Name: //p' || true)"
+      deps="$(llvm-readobj --coff-imports "$bin" | sed -n 's/^ *Name: //p')"
     elif command -v dumpbin >/dev/null 2>&1; then
-      deps="$(dumpbin -nologo -dependents "$bin" | tr -d '\r' || true)"
+      deps="$(dumpbin -nologo -dependents "$bin" | tr -d '\r')"
     else
       echo "   FAIL  neither llvm-readobj nor dumpbin is on PATH, so the import table was not read" >&2
       exit 1

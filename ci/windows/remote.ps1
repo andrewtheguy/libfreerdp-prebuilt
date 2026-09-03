@@ -10,3 +10,5 @@ if (-not (Test-Path $SharedScript)) {
 }
 $env:DEVTOOLS_REPO_ROOT = $RepoRoot
 & $SharedScript @Rest
+# A script that ends without `exit` exits 0 whatever the last command did.
+exit $LASTEXITCODE

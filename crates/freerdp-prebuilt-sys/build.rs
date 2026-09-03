@@ -157,7 +157,7 @@ impl Manifest {
             &[
                 "kernel32", "user32", "advapi32", "ws2_32", "crypt32", "secur32", "rpcrt4",
                 "shlwapi", "shell32", "gdi32", "ole32", "credui", "cfgmgr32", "dbghelp", "bcrypt",
-                "ncrypt", "iphlpapi", "setupapi",
+                "ncrypt", "ntdll", "uuid", "iphlpapi", "setupapi",
             ]
         } else {
             &["m", "dl", "pthread", "rt"]
