@@ -109,6 +109,16 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      # rustc takes link.exe from PATH once a developer environment is active (VCINSTALLDIR set),
+      # and in Git's bash — every `shell: bash` step here — PATH's link.exe is coreutils' link(1)
+      # from usr\bin. Name the real one to cargo for every later step, whatever shell runs it;
+      # with no `--target`, the host setting covers the build scripts too.
+      - name: Point cargo at MSVC's linker (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          link="$(cygpath -u "$VCToolsInstallDir")bin/Hostx64/x64/link.exe"
+          test -x "$link" || { echo "::error::no link.exe at $link"; exit 1; }
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$(cygpath -w "$link")" >> "$GITHUB_ENV"
       - name: Install nasm
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
