@@ -353,7 +353,7 @@ if [ "${1:-}" = "--check" ]; then
   trap 'rm -f "$tmp"' EXIT
   generate > "$tmp"
   assert_complete "$tmp"
-  if diff -u "$out" "$tmp"; then
+  if diff -u --strip-trailing-cr "$out" "$tmp"; then
     echo "$out matches the committed FreeRDP $FREERDP_VERSION headers"
     # Said out loud, because a green check here covers *one* platform. The other file is checked
     # by the other platform's CI job, and nothing on this machine can speak for it.

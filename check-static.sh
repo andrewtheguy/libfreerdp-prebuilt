@@ -27,6 +27,9 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 bin="${1:?usage: ./check-static.sh <binary>}"
+# Under an MSYS bash `-f foo` is true when only foo.exe exists and `foo` runs it; the native
+# LLVM tool below gets no such help, so the name is completed here.
+[ -f "$bin.exe" ] && bin="$bin.exe"
 [ -f "$bin" ] || { echo "no such file: $bin" >&2; exit 1; }
 
 # shellcheck source=freerdp.env

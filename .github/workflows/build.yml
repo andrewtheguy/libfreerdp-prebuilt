@@ -175,7 +175,7 @@ jobs:
       - name: End to end — a real binary that links the archives
         run: |
           bin=target/release/freerdp-e2e
-          [ -f "$bin" ] || bin="$bin.exe"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
           "$bin"
           ./check-static.sh "$bin"
 
