@@ -1,0 +1,3 @@
+# LF on every checkout. Git for Windows defaults to CRLF checkouts, and the bindings check
+# compares the committed bytes against freshly generated LF ones.
+* text=auto eol=lf
