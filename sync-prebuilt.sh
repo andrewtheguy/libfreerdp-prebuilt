@@ -101,22 +101,41 @@ drift_allow="header-drift.allow"
 # same list gen-bindings.sh hands bindgen — so the headers take the `_WIN32` branches there, which
 # reach a different set: `winpr/windows.h` pulls the SDK in and `synch.h` stops declaring things.
 # `-MM` keeps the SDK out of the list the same way it keeps glibc out.
+compiler=(cc)
+case "$(uname -s)" in
+  MINGW* | MSYS*)
+    compiler=(
+      clang --target=x86_64-pc-windows-msvc
+      -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
+      -D_WINSOCK_DEPRECATED_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+    )
+    ;;
+esac
+#
+# The paths come back the way the include directory was spelled, so `$root` is kept relative and
+# clean — a `dist/*/` glob's trailing slash would put a `//` in it that the compiler does not echo
+# back — and the prefix strips cleanly. Except on Windows, where clang prints Make dependencies in
+# the platform's native form, backslashes and all; those are folded to `/` before the match.
 reachable_headers() {
-  local root="$1" compiler=(cc)
-  case "$(uname -s)" in
-    MINGW* | MSYS*)
-      compiler=(
-        clang --target=x86_64-pc-windows-msvc
-        -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
-        -D_WINSOCK_DEPRECATED_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
-      )
-      ;;
-  esac
+  local root="$1"
   "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
     | tr ' ' '\n' \
     | tr -d '\r' \
+    | tr '\\' '/' \
     | sed -n "s#^$root/##p" \
     | sort -u
+}
+# What the empty list hid: the compiler's own stderr is lost in the process substitution the
+# callers read from, so it is run once more here, to the terminal, when the count is wrong, with
+# the first lines of what it printed — the shape of the paths is the usual reason.
+reachable_headers_diagnose() {
+  local root="$1" status=0
+  echo "  compiler: $(command -v "${compiler[0]}" || echo "${compiler[0]} not on PATH")" >&2
+  "${compiler[0]}" --version 2>&1 | head -1 | sed 's/^/  /' >&2 || true
+  "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" 2>&1 \
+    | head -3 | sed 's/^/  | /' >&2 || true
+  "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" >/dev/null 2>&1 || status=$?
+  echo "  the -MM line exited $status" >&2
 }
 
 case "${1:-}" in
@@ -143,7 +162,8 @@ case "${1:-}" in
     [ "${#wanted[@]}" -gt 50 ] || {
       echo "only ${#wanted[@]} headers reachable from wrapper.h, which cannot be right" >&2
       echo "  A parse failure in wrapper.h reports as an empty dependency list, so this is" >&2
-      echo "  checked rather than trusted. Run the cc line by hand to see the error." >&2
+      echo "  checked rather than trusted." >&2
+      reachable_headers_diagnose "$src/include"
       exit 1
     }
 
@@ -191,6 +211,7 @@ case "${1:-}" in
     # stopped including.
     checked=0
     for dir in dist/*/; do
+      dir="${dir%/}"
       target="$(basename "$dir")"
       [ -d "$dir/include" ] || continue
       checked=$((checked + 1))
@@ -201,6 +222,7 @@ case "${1:-}" in
       [ "${#wanted[@]}" -gt 50 ] || {
         echo "only ${#wanted[@]} headers reachable from wrapper.h against $target" >&2
         echo "  A parse failure reports as an empty dependency list, so this is checked." >&2
+        reachable_headers_diagnose "$dir/include"
         exit 1
       }
 
@@ -212,6 +234,12 @@ case "${1:-}" in
         elif ! cmp -s "$dir/include/$header" "$crate/include/$header" \
           && ! grep -qxF "$header" "$drift_allow" 2>/dev/null; then
           differing+="  $header"$'\n'
+          # Two lines from each side, through `cat -A` so a CR, the usual culprit, shows as `^M`
+          # rather than as nothing. diff's exit 1 is the point, and awk reads to the end where
+          # `head` would not, so neither trips `set -o pipefail`.
+          differing+="$({ diff "$crate/include/$header" "$dir/include/$header" || true; } \
+            | cat -A | awk '/^< /{if(l++<2)print} /^> /{if(r++<2)print}' \
+            | sed 's/\$$//; s/^/    | /')"$'\n'
         fi
       done
 
@@ -315,6 +343,7 @@ case "${1:-}" in
     [ -d dist ] || { echo "nothing in dist/ — run ./build.sh <target> first" >&2; exit 1; }
     found=0
     for dir in dist/*/; do
+      dir="${dir%/}"
       target="$(basename "$dir")"
       [ -f "$dir/MANIFEST" ] || continue
       rm -rf "${prebuilt:?}/${target:?}"

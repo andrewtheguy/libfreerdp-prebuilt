@@ -492,6 +492,12 @@ cp -R "$work/prefix/include/winpr3" "$out/include-winpr3"
 mkdir -p "$out/include"
 mv "$out/include-freerdp3" "$out/include/freerdp3"
 mv "$out/include-winpr3" "$out/include/winpr3"
+# The generated ones come out of cmake's configure_file, which on Windows writes CRLF — the
+# stream is in text mode there. The tarball's headers are LF and so are the committed ones, so
+# the archive ships LF throughout rather than a line ending per file's provenance.
+case "$target" in
+  windows-*) find "$out/include" -name '*.h' -exec sed -i 's/\r$//' {} + ;;
+esac
 
 # FreeRDP's licence and OpenSSL's, from the same verified tarballs. Both travel with the archive
 # rather than being left behind in a build tree: whoever links this redistributes both, and each
