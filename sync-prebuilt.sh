@@ -101,22 +101,32 @@ drift_allow="header-drift.allow"
 # same list gen-bindings.sh hands bindgen — so the headers take the `_WIN32` branches there, which
 # reach a different set: `winpr/windows.h` pulls the SDK in and `synch.h` stops declaring things.
 # `-MM` keeps the SDK out of the list the same way it keeps glibc out.
+compiler=(cc)
+case "$(uname -s)" in
+  MINGW* | MSYS*)
+    compiler=(
+      clang --target=x86_64-pc-windows-msvc
+      -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
+      -D_WINSOCK_DEPRECATED_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
+    )
+    ;;
+esac
 reachable_headers() {
-  local root="$1" compiler=(cc)
-  case "$(uname -s)" in
-    MINGW* | MSYS*)
-      compiler=(
-        clang --target=x86_64-pc-windows-msvc
-        -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS
-        -D_WINSOCK_DEPRECATED_NO_WARNINGS -DWINVER=0x0601 -D_WIN32_WINNT=0x0601
-      )
-      ;;
-  esac
+  local root="$1"
   "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
     | tr ' ' '\n' \
     | tr -d '\r' \
     | sed -n "s#^$root/##p" \
     | sort -u
+}
+# What the empty list hid: the compiler's own stderr is lost in the process substitution the
+# callers read from, so it is run once more here, to the terminal, when the count is wrong.
+reachable_headers_diagnose() {
+  local root="$1" status=0
+  echo "  compiler: $(command -v "${compiler[0]}" || echo "${compiler[0]} not on PATH")" >&2
+  "${compiler[0]}" --version 2>&1 | head -1 | sed 's/^/  /' >&2 || true
+  "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" >/dev/null || status=$?
+  echo "  the -MM line exited $status" >&2
 }
 
 case "${1:-}" in
@@ -143,7 +153,8 @@ case "${1:-}" in
     [ "${#wanted[@]}" -gt 50 ] || {
       echo "only ${#wanted[@]} headers reachable from wrapper.h, which cannot be right" >&2
       echo "  A parse failure in wrapper.h reports as an empty dependency list, so this is" >&2
-      echo "  checked rather than trusted. Run the cc line by hand to see the error." >&2
+      echo "  checked rather than trusted." >&2
+      reachable_headers_diagnose "$src/include"
       exit 1
     }
 
@@ -201,6 +212,7 @@ case "${1:-}" in
       [ "${#wanted[@]}" -gt 50 ] || {
         echo "only ${#wanted[@]} headers reachable from wrapper.h against $target" >&2
         echo "  A parse failure reports as an empty dependency list, so this is checked." >&2
+        reachable_headers_diagnose "$dir/include"
         exit 1
       }
 
