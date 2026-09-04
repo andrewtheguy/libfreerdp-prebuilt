@@ -234,6 +234,12 @@ case "${1:-}" in
         elif ! cmp -s "$dir/include/$header" "$crate/include/$header" \
           && ! grep -qxF "$header" "$drift_allow" 2>/dev/null; then
           differing+="  $header"$'\n'
+          # Two lines from each side, through `cat -A` so a CR, the usual culprit, shows as `^M`
+          # rather than as nothing. diff's exit 1 is the point, and awk reads to the end where
+          # `head` would not, so neither trips `set -o pipefail`.
+          differing+="$({ diff "$crate/include/$header" "$dir/include/$header" || true; } \
+            | cat -A | awk '/^< /{if(l++<2)print} /^> /{if(r++<2)print}' \
+            | sed 's/\$$//; s/^/    | /')"$'\n'
         fi
       done
 
