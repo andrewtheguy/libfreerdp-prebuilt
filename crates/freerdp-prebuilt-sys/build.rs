@@ -8,8 +8,10 @@
 //   2. `prebuilt/<target>/` next to this file — what `./build.sh` + `./sync-prebuilt.sh` leave
 //      behind, and gitignored, because a committed `.a` is one nobody can tell apart from the
 //      one CI made.
-//   3. the repository's **latest** GitHub release, downloaded once per machine into
-//      `$CARGO_HOME/freerdp-prebuilt/`.
+//   3. the repository's **latest** GitHub release, downloaded into
+//      `$CARGO_HOME/freerdp-prebuilt/<release tag>/` — one directory per release, so a
+//      build links the archives of the release current when it runs rather than whichever
+//      one this machine happened to download first.
 //
 // (3) is what makes a fresh clone of a consuming project build with nothing installed; (1) is
 // what makes it work with no network at all.
@@ -328,30 +330,125 @@ fn resolve(manifest_dir: &Path, target: &str, version: &str) -> (PathBuf, String
         return (local, format!("prebuilt/{name}"));
     }
 
-    let cached = cache_root().join(version).join(name);
-    if cached.join("lib").is_dir() {
-        return (cached, format!("cache/{version}/{name}"));
-    }
-
-    (fetch(manifest_dir, name, version, &cached), format!("latest release asset for {name}"))
-}
-
-/// Download the latest release's archive for one target and unpack it into the cache.
-///
-/// `releases/latest/download/…` rather than a pinned tag: a tag written in here is a tag that has
-/// to be updated in here. The asset name carries the FreeRDP version, so a release of a
-/// *different* version cannot satisfy the URL — it 404s naming the version rather than quietly
-/// returning the wrong library.
-fn fetch(manifest_dir: &Path, name: &str, version: &str, cached: &Path) -> PathBuf {
+    // `latest` is a moving pointer, so the cache is keyed by what it currently points at rather
+    // than by the library version. Two releases of the same FreeRDP carry different archives —
+    // an option changed, a channel added, a patch applied — and a cache directory named after the
+    // version alone answers for every one of them forever: whichever release this machine
+    // downloaded first is the one every later build links, and the symptom is a feature quietly
+    // missing rather than a failure. Keyed by the release tag, last month's archives are simply a
+    // different directory from this month's, and asking which release `latest` is costs one
+    // redirect with no body.
+    let repo = freerdp_env(manifest_dir, "PREBUILT_REPO");
+    let Some(tag) = latest_release_tag(&repo) else {
+        return offline_cache(name, version);
+    };
+    // The asset name carries the version, so a version the releases have moved past would
+    // otherwise surface as a 404 on a URL nobody typed. Said here, where both halves are known.
     assert!(
-        std::env::var("CARGO_NET_OFFLINE").as_deref() != Ok("true"),
-        "FreeRDP for {name} is not cached and cargo is offline. Run ./build.sh {name} && \
-         ./sync-prebuilt.sh, or set FREERDP_PREBUILT_DIR to a prefix containing lib/."
+        tag.starts_with(&format!("v{version}-")),
+        "the latest release of {repo} is {tag}, which is not FreeRDP {version} — the version \
+         this crate builds against. Depend on a tag of this repository whose release is the \
+         current one, or set FREERDP_PREBUILT_DIR to a prefix you built yourself."
     );
 
-    let repo = freerdp_env(manifest_dir, "PREBUILT_REPO");
+    let cached = cache_root().join(&tag).join(name);
+    if cached.join("lib").is_dir() {
+        return (cached, format!("cache/{tag}/{name}"));
+    }
+
+    (fetch(&repo, name, version, &tag, &cached), format!("{tag} asset for {name}"))
+}
+
+/// Which release `latest` is, right now.
+///
+/// `https://github.com/<repo>/releases/latest` redirects to `…/releases/tag/<tag>`, so the answer
+/// is the Location header and nothing else is transferred: a HEAD, no body, and none of
+/// `api.github.com`'s sixty-requests-an-hour ceiling for the unauthenticated. The alternative is
+/// asking the API and parsing JSON, in a build script whose whole selling point is that it
+/// compiles no dependencies.
+///
+/// `None` means **cannot ask**, never *no release*: cargo was told it is offline, or curl could
+/// not reach GitHub, or the redirect was not one of these. The caller then falls back to the
+/// newest release this machine already has, and the provenance line says that is what happened.
+fn latest_release_tag(repo: &str) -> Option<String> {
+    if std::env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true") {
+        println!("cargo:info=cargo is offline — using the newest cached release of FreeRDP");
+        return None;
+    }
+
+    // The null device is the *host's*, since curl runs here rather than on the target, which is
+    // exactly what `cfg!` reports in a build script.
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let url = format!("https://github.com/{repo}/releases/latest");
+    let out = Command::new("curl")
+        .args(["-sS", "--fail", "--head", "--max-time", "30", "--retry", "2", "-o", null])
+        .args(["-w", "%{redirect_url}", &url])
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run curl: {e}"));
+
+    // A warning rather than a panic: a network that did not answer must not fail a build that
+    // has a usable archive, and a warning rather than nothing because the archive it falls back
+    // to may be older than what is published — which is the whole failure this keying exists to
+    // end, and it should never happen quietly.
+    let stale = |why: String| {
+        println!(
+            "cargo:warning=cannot ask {repo} which release is latest ({why}) — falling back to \
+             the newest cached FreeRDP archive, which may be out of date"
+        );
+        None
+    };
+    if !out.status.success() {
+        return stale(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let location = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let Some((_, tag)) = location.rsplit_once("/releases/tag/") else {
+        return stale(format!("{url} redirected to '{location}'"));
+    };
+    // The tag becomes a directory name below, so it may not be one that names somewhere else.
+    if tag.is_empty() || tag.starts_with('.') || tag.contains(['/', '\\']) {
+        return stale(format!("'{tag}' is not a usable directory name"));
+    }
+    Some(tag.to_string())
+}
+
+/// The newest cached release of this version, for a machine that cannot ask which one is current.
+///
+/// A tag's stamp is a fixed-width UTC timestamp (`v{version}-YYYYMMDDHHMMSS-<short sha>`), so
+/// within one version the tags sort lexicographically in the order the releases happened and the
+/// maximum is the newest archive set this machine holds. It can still be behind what the
+/// repository has published — that is the unavoidable cost of not being able to look, and it is
+/// why the provenance says so rather than reading like a fresh download.
+fn offline_cache(name: &str, version: &str) -> (PathBuf, String) {
+    let root = cache_root();
+    let prefix = format!("v{version}-");
+    let newest = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let tag = entry.file_name().to_string_lossy().into_owned();
+            (tag.starts_with(&prefix) && root.join(&tag).join(name).join("lib").is_dir())
+                .then_some(tag)
+        })
+        .max();
+
+    match newest {
+        Some(tag) => {
+            let path = root.join(&tag).join(name);
+            (path, format!("cache/{tag}/{name}, not revalidated"))
+        }
+        None => panic!(
+            "no cached FreeRDP {version} for {name}, and which release is current cannot \
+             be asked. Run ./build.sh {name} && ./sync-prebuilt.sh, or set FREERDP_PREBUILT_DIR \
+             to a prefix containing lib/."
+        ),
+    }
+}
+
+/// Download one target's archive from a named release and unpack it into the cache.
+fn fetch(repo: &str, name: &str, version: &str, tag: &str, cached: &Path) -> PathBuf {
     let asset = format!("freerdp-{version}-{name}.tar.gz");
-    let base = format!("https://github.com/{repo}/releases/latest/download");
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
 
     // Staged under a pid-suffixed name so two cargo builds racing here cannot read each other's
     // half-written tarball. The loser of the race throws its copy away below.
@@ -365,17 +462,19 @@ fn fetch(manifest_dir: &Path, name: &str, version: &str, cached: &Path) -> PathB
     if !curl(&format!("{base}/{asset}"), &tarball) {
         panic!("cannot download {base}/{asset}");
     }
-    // Both URLs resolve `latest` independently, so a release published between these two requests
-    // would give a mismatch below rather than a wrong library — which is the right way round for
-    // a race this unlikely.
+    // Both URLs name the same release rather than resolving `latest` a second time, so a
+    // release published while the archive is in flight cannot swap it out from under the
+    // checksums that are about to be read.
     if !curl(&format!("{base}/SHA256SUMS"), &sums) {
         panic!(
-            "cannot download {base}/SHA256SUMS\n\nEvery release publishes one beside the \
-             archives. If the latest release predates that, upgrade this crate or set \
-             FREERDP_PREBUILT_DIR to a prefix you built yourself."
+            "cannot download {base}/SHA256SUMS
+
+Every release publishes one beside the \
+             archives. If {tag} predates that, run this repository's release workflow \
+             again, or set FREERDP_PREBUILT_DIR to a prefix you built yourself."
         );
     }
-    verify_download(&sums, &asset, &tarball);
+    verify_download(&sums, &asset, &tarball, tag);
 
     // `tar` rather than a Rust tar crate: it is present on macOS, on every Linux image that can
     // run cargo, and in System32 on Windows 10 1803 and later, and a build dependency here would
@@ -400,7 +499,7 @@ fn fetch(manifest_dir: &Path, name: &str, version: &str, cached: &Path) -> PathB
 /// replaces relying on `tar` to notice: gzip's CRC does catch corruption, but it reports it as
 /// "unexpected end of file" from a program the user did not know was running, which is a worse
 /// sentence than this one.
-fn verify_download(sums: &Path, asset: &str, tarball: &Path) {
+fn verify_download(sums: &Path, asset: &str, tarball: &Path, tag: &str) {
     let text = std::fs::read_to_string(sums).expect("cannot read the downloaded SHA256SUMS");
     // coreutils writes `<hex>  <name>`, and `sha256sum ./*.tar.gz` would prefix the name with
     // `./` — accepted here so that how the release job spelled its glob cannot break every
@@ -412,7 +511,7 @@ fn verify_download(sums: &Path, asset: &str, tarball: &Path) {
             (rest.trim().trim_start_matches("./") == asset).then_some(hash)
         })
         .unwrap_or_else(|| {
-            panic!("SHA256SUMS on the latest release does not list {asset}:\n{text}")
+            panic!("SHA256SUMS on {tag} does not list {asset}:\n{text}")
         });
 
     let bytes = std::fs::read(tarball).expect("cannot read the downloaded archive");
@@ -450,9 +549,9 @@ fn run(cmd: &mut Command) {
     }
 }
 
-/// `$CARGO_HOME/freerdp-prebuilt/`, so the download happens once per machine rather than once per
-/// project — and so the many Docker builds that already cache `~/.cargo` get it for free with no
-/// extra configuration.
+/// `$CARGO_HOME/freerdp-prebuilt/<release tag>/`, one directory per release, so the download
+/// happens once per machine rather than once per project — and so the many Docker builds that
+/// already cache `~/.cargo` get it for free with no extra configuration.
 fn cache_root() -> PathBuf {
     let home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
