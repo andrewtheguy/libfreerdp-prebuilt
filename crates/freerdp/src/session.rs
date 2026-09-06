@@ -16,7 +16,7 @@
 
 use freerdp_sys as sys;
 
-use crate::audio::{self, Audio};
+use crate::audio::{self, Audio, AudioMode};
 use crate::camera::Camera;
 use crate::clipboard::{self, Clipboard, ClipboardEvent, ClipboardFormat};
 use crate::mic::Microphone;
@@ -93,14 +93,15 @@ pub struct Connect {
     pub security: Security,
     /// Whether to load `cliprdr`. When false there is no [`Session::clipboard`].
     pub clipboard: bool,
-    /// Whether to load `rdpsnd` and where its wave buffers go. `None` asks the server for no
-    /// sound at all, which is the default.
+    /// Where the session's sound goes: redirected here through a sink, left on the host (the
+    /// default), or played nowhere — see [`AudioMode`] for the three and why the choice is
+    /// fixed at logon. `rdpsnd` is loaded only for [`AudioMode::Redirect`].
     ///
-    /// Unlike every other output this crate produces, sound does **not** arrive as an [`Event`]:
-    /// the sink is called on the FreeRDP thread as each buffer is decoded. That is what keeps it
-    /// off the back of a queue of paint rectangles — see [`AudioSink`](crate::AudioSink), which
-    /// also says what a sink may not do on that thread.
-    pub audio: Option<Audio>,
+    /// Unlike every other output this crate produces, redirected sound does **not** arrive as an
+    /// [`Event`]: the sink is called on the FreeRDP thread as each buffer is decoded. That is
+    /// what keeps it off the back of a queue of paint rectangles — see
+    /// [`AudioSink`](crate::AudioSink), which also says what a sink may not do on that thread.
+    pub audio: AudioMode,
     /// Whether to speak MS-RDPECAM and where the host's streaming decisions go. `None` offers
     /// the server no camera redirection at all, which is the default.
     ///
@@ -182,7 +183,7 @@ impl Default for Connect {
             height: 768,
             security: Security::default(),
             clipboard: true,
-            audio: None,
+            audio: AudioMode::LeaveOnHost,
             camera: None,
             microphone: None,
             resize: false,
@@ -525,7 +526,7 @@ struct WrapperContext {
 pub(crate) struct Bridge {
     events: Sender<Event>,
     shared: Arc<Shared>,
-    /// Where redirected sound goes, and `None` on a session that asked for none — in which case
+    /// Where redirected sound goes, and `None` on a session that redirects none — in which case
     /// `rdpsnd` was never registered and nothing in `audio.rs` can be reached at all.
     pub(crate) audio: Option<Audio>,
     /// The session's camera, and `None` on a session that configured none — in which case
@@ -661,7 +662,7 @@ fn run(config: Connect, shared: &Arc<Shared>, events: &Sender<Event>) -> Result<
     let bridge = Box::into_raw(Box::new(Bridge {
         events: events.clone(),
         shared: Arc::clone(shared),
-        audio: config.audio.clone(),
+        audio: config.audio.redirected().cloned(),
         camera: config.camera.clone(),
         microphone: config.microphone.clone(),
         audio_device: std::ptr::null_mut(),
@@ -742,7 +743,8 @@ fn run_connected(
     // in which another session could take it back is the gap between here and `freerdp_connect`
     // loading the channels — narrow rather than closed, and `audio::install_provider` says why
     // it cannot be closed at all. One provider answers for both channels; see `addin_provider`.
-    if config.audio.is_some() || config.camera.is_some() || config.microphone.is_some() {
+    if config.audio.redirected().is_some() || config.camera.is_some() || config.microphone.is_some()
+    {
         audio::install_provider()?;
     }
 
@@ -897,11 +899,22 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         (B::FreeRDP_SupportMultitransport, false),
         (B::FreeRDP_SupportHeartbeatPdu, false),
         (B::FreeRDP_RedirectClipboard, config.clipboard),
-        // Sound. Like the clipboard's key this is both the capability and the channel switch —
-        // `freerdp_client_load_addins` maps it to `rdpsnd` — but unlike the clipboard's it is not
-        // sufficient on its own, because a channel with no `sys:` argument picks its own backend
-        // and this build's list ends in `fake`. `register_audio_channels` below puts the name in.
-        (B::FreeRDP_AudioPlayback, config.audio.is_some()),
+        // Sound, as the two flags of the Client Info PDU. `rdp_write_info_packet` writes
+        // `INFO_NOAUDIOPLAYBACK` when `AudioPlayback` is off and `INFO_REMOTECONSOLEAUDIO` when
+        // `RemoteConsoleAudio` is on, and Windows reads that pair once, at logon, to decide what
+        // the session's audio device is — so this is where `AudioMode` becomes a fact about the
+        // session. Exclusive, the way mstsc sends them: redirect sets neither, leave-on-host the
+        // second alone, mute the first alone. FreeRDP's own `/audio-mode:1` leaves `AudioPlayback`
+        // at whatever it was, and with its default of off that sends *both* — a combination the
+        // spec does not describe and Microsoft's client never produces, so it is not sent here.
+        //
+        // `AudioPlayback` is also the key `freerdp_client_load_addins` would map to `rdpsnd`, but
+        // this crate never calls that: the channel is registered by `register_audio_channels`
+        // below, and only for `Redirect`, because a channel with no `sys:` argument picks its own
+        // backend and this build's list ends in `fake`. So the key being on for `LeaveOnHost`
+        // loads nothing; it only keeps the mute flag out of the PDU.
+        (B::FreeRDP_AudioPlayback, !matches!(config.audio, AudioMode::Mute)),
+        (B::FreeRDP_RemoteConsoleAudio, matches!(config.audio, AudioMode::LeaveOnHost)),
         // Microphone. Unlike `rdpecam`, registering the `audin` channel is not
         // enough: a server opens AUDIO_INPUT only for a client that advertises
         // audio-capture support in its info PDU, which is this capability bit.
@@ -1057,7 +1070,7 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         }
     }
 
-    if config.audio.is_some() {
+    if config.audio.redirected().is_some() {
         register_audio_channels(settings)?;
     }
     if config.camera.is_some() {
@@ -2873,9 +2886,11 @@ mod tests {
         assert!(connect.clipboard);
         // Off, and the opposite of the clipboard on purpose — a resize renegotiates the session.
         assert!(!connect.resize);
-        // Also off: sound a caller never asked for is bandwidth it never asked for, and unlike
-        // the clipboard there is nowhere for it to go by default.
-        assert!(connect.audio.is_none());
+        // Not redirected: sound a caller never asked for is bandwidth it never asked for, and
+        // unlike the clipboard there is nowhere for it to go by default. Left on the host rather
+        // than muted, because a caller that said nothing about sound has no reason to take the
+        // host's own speakers away from it.
+        assert!(matches!(connect.audio, AudioMode::LeaveOnHost));
 
         let keepalive = KeepAlive::default();
         assert_eq!(seconds(keepalive.idle), 10);
@@ -2933,6 +2948,62 @@ mod tests {
             }
             sys::freerdp_settings_free(settings);
         }
+    }
+
+    /// The two audio settings are a *mode*, not a switch, and each position of [`AudioMode`] is
+    /// exactly one of mstsc's: pinned because the difference is invisible from this side — all
+    /// three connect, two are silent here, and only the host's own speakers tell those two apart.
+    #[test]
+    fn each_audio_mode_is_one_of_mstscs() {
+        use crate::audio::{AudioFormat, AudioSink};
+
+        struct Mute;
+        impl AudioSink for Mute {
+            fn negotiated(&self, _: usize) {}
+            fn opened(&self, _: AudioFormat) {}
+            fn wave(&self, _: &[u8]) {}
+            fn closed(&self) {}
+        }
+
+        /// `(AudioPlayback, RemoteConsoleAudio)` after `apply_settings`, and whether `rdpsnd`
+        /// was registered.
+        fn applied(audio: AudioMode) -> ((bool, bool), bool) {
+            use sys::FreeRDP_Settings_Keys_Bool as B;
+            let config = Connect { audio, ..Connect::default() };
+            let mut entry: sys::RDP_CLIENT_ENTRY_POINTS = unsafe { std::mem::zeroed() };
+            entry.Size = std::mem::size_of::<sys::RDP_CLIENT_ENTRY_POINTS>() as u32;
+            entry.Version = sys::RDP_CLIENT_INTERFACE_VERSION;
+            entry.ContextSize = std::mem::size_of::<WrapperContext>() as u32;
+            entry.ClientNew = Some(client_new);
+            entry.ClientFree = Some(client_free);
+            // SAFETY: a context created and freed here, with the same entry points `run` uses,
+            // and `apply_settings` reads only what `freerdp_client_context_new` allocated.
+            unsafe {
+                let ctx = sys::freerdp_client_context_new(&entry);
+                assert!(!ctx.is_null());
+                let guard = ContextGuard(ctx);
+                apply_settings(&config, ctx).expect("apply_settings");
+                let settings = (*ctx).settings;
+                let flags = (
+                    sys::freerdp_settings_get_bool(settings, B::FreeRDP_AudioPlayback) != 0,
+                    sys::freerdp_settings_get_bool(settings, B::FreeRDP_RemoteConsoleAudio) != 0,
+                );
+                let rdpsnd =
+                    !sys::freerdp_static_channel_collection_find(settings, c"rdpsnd".as_ptr())
+                        .is_null();
+                drop(guard);
+                (flags, rdpsnd)
+            }
+        }
+
+        // `/audio-mode:0`: neither info flag, and the channel.
+        let redirect = AudioMode::Redirect(Audio { format: AudioFormat::CD, sink: Arc::new(Mute) });
+        assert_eq!(applied(redirect), ((true, false), true));
+        // `/audio-mode:1`: INFO_REMOTECONSOLEAUDIO alone, no channel — and the default.
+        assert_eq!(applied(AudioMode::LeaveOnHost), ((true, true), false));
+        assert_eq!(applied(AudioMode::default()), ((true, true), false));
+        // `/audio-mode:2`: INFO_NOAUDIOPLAYBACK alone, no channel.
+        assert_eq!(applied(AudioMode::Mute), ((false, false), false));
     }
 
     /// A duration too large for FreeRDP's `UINT32` saturates rather than wrapping — a wrapped
