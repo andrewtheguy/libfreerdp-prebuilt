@@ -22,6 +22,7 @@
 //! Exit code 0 means every check that ran passed. Anything else prints why.
 
 use freerdp::{
+    AudioMode,
     Audio, AudioFormat, AudioSink, Camera, CameraEvents, CameraFormat, ClipboardEvent,
     ClipboardFormat, Connect, Event, Session,
 };
@@ -216,7 +217,7 @@ fn connect_check(host: &str, port: u16, username: &str, password: &str) {
         // the same path through its own configuration, and remotex printed the same
         // `update_dump_stats` counters under `WLOG_LEVEL=TRACE` with `egfx = false` on a target.
         egfx: std::env::var("E2E_EGFX").as_deref() != Ok("0"),
-        audio: Some(Audio { format: AudioFormat::CD, sink: recorder.clone() }),
+        audio: AudioMode::Redirect(Audio { format: AudioFormat::CD, sink: recorder.clone() }),
         camera: Some(camera.clone()),
         ..Connect::default()
     });

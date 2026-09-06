@@ -114,6 +114,41 @@ pub struct Audio {
     pub sink: Arc<dyn AudioSink>,
 }
 
+/// Where a session's sound goes — the three positions of mstsc's "Remote audio playback"
+/// setting, which are FreeRDP's `/audio-mode:0|1|2` and two flags in the Client Info PDU.
+///
+/// Windows reads the choice once, at logon, to decide what the session's audio device is, so it
+/// holds for the life of the session: a session cannot start redirecting later, and one that
+/// redirects cannot hand the sound back. Which position a consumer offers its users is the
+/// consumer's decision; this crate only makes all three reachable. The flags are exclusive, the
+/// way mstsc sends them (MS-RDPBCGR 2.2.1.11.1.1): `INFO_REMOTECONSOLEAUDIO` alone for
+/// [`LeaveOnHost`](Self::LeaveOnHost), `INFO_NOAUDIOPLAYBACK` alone for [`Mute`](Self::Mute),
+/// neither for [`Redirect`](Self::Redirect).
+#[derive(Clone, Default)]
+pub enum AudioMode {
+    /// Bring the sound here: `rdpsnd` is registered with this crate as its device and every wave
+    /// buffer reaches the sink. Mode 0.
+    Redirect(Audio),
+    /// Leave the sound on the host's own speakers — or the headset paired to it — which is what a
+    /// session that carries no audio should mean, and the default. Mode 1.
+    #[default]
+    LeaveOnHost,
+    /// Play nothing anywhere: the session gets no audio device at all, so the host's own
+    /// endpoints go quiet for it too. Mode 2, and the one position a consumer has to ask for.
+    Mute,
+}
+
+impl AudioMode {
+    /// The redirected sound's destination, when there is one. `None` for both silent positions,
+    /// in which case `rdpsnd` is never registered and nothing in this module can be reached.
+    pub fn redirected(&self) -> Option<&Audio> {
+        match self {
+            Self::Redirect(audio) => Some(audio),
+            Self::LeaveOnHost | Self::Mute => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for Audio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Audio").field("format", &self.format).finish_non_exhaustive()

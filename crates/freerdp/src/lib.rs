@@ -95,7 +95,7 @@ mod mic;
 mod pointer;
 mod session;
 
-pub use audio::{Audio, AudioFormat, AudioSink};
+pub use audio::{Audio, AudioFormat, AudioMode, AudioSink};
 pub use camera::{Camera, CameraEvents, CameraFormat};
 pub use mic::{MicEvents, MicFormat, Microphone};
 pub use clipboard::{Clipboard, ClipboardEvent, ClipboardFormat};
