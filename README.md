@@ -145,7 +145,9 @@ for, and a session that never asks never meets it. The graphics pipeline is its 
 a graphics reset instead of that renegotiation, at the price of a Windows host rendering text that
 stays soft afterwards — the embedder picks which failure it can live with.
 
-Sound is off by default too (`Connect::audio`), and arrives differently from everything else: not
+Sound is off by default too (`Connect::audio`, and off means *left on the host*, not muted — the
+info PDU says `INFO_REMOTECONSOLEAUDIO`, never `INFO_NOAUDIOPLAYBACK`), and arrives differently
+from everything else: not
 as an `Event` but through an `AudioSink` called on the FreeRDP thread, so a wave buffer never
 queues behind a backlog of paint rectangles. The way in is that `crates/freerdp` **is** the audio
 device — `rdpsnd` loads a backend the way an ordinary client loads ALSA, and this one is Rust. Two

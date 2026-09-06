@@ -93,8 +93,10 @@ pub struct Connect {
     pub security: Security,
     /// Whether to load `cliprdr`. When false there is no [`Session::clipboard`].
     pub clipboard: bool,
-    /// Whether to load `rdpsnd` and where its wave buffers go. `None` asks the server for no
-    /// sound at all, which is the default.
+    /// Whether to load `rdpsnd` and where its wave buffers go. `None`, the default, redirects
+    /// nothing and tells the server to leave its sound on its own speakers — FreeRDP's
+    /// `/audio-mode:1` — rather than to mute the session, so a headset paired to the host still
+    /// works during a session that carries no audio.
     ///
     /// Unlike every other output this crate produces, sound does **not** arrive as an [`Event`]:
     /// the sink is called on the FreeRDP thread as each buffer is decoded. That is what keeps it
@@ -902,6 +904,17 @@ fn apply_settings(config: &Connect, ctx: *mut sys::rdpContext) -> Result<(), Err
         // sufficient on its own, because a channel with no `sys:` argument picks its own backend
         // and this build's list ends in `fake`. `register_audio_channels` below puts the name in.
         (B::FreeRDP_AudioPlayback, config.audio.is_some()),
+        // And when sound is *not* redirected, leave it on the host rather than muting it. The two
+        // settings are FreeRDP's `/audio-mode`: playback on alone is mode 0 (bring it here), this
+        // one is mode 1 (leave it at the remote computer), and neither is mode 2 (do not play).
+        // `rdp_write_info_packet` turns them into the info PDU's flags — `INFO_NOAUDIOPLAYBACK`
+        // for playback off, `INFO_REMOTECONSOLEAUDIO` for this — and Windows reads the pair once,
+        // at logon, to decide what the session's audio device is. Off without this flag is mode 2:
+        // the session gets no audio device at all, so the host's own speakers go quiet for it too,
+        // and a Bluetooth headset paired to the host is unusable for as long as the session lasts.
+        // With it the session keeps the console's endpoints, which is what "no audio" means to the
+        // embedder's other protocols, none of which can take a remote's sound away from it.
+        (B::FreeRDP_RemoteConsoleAudio, config.audio.is_none()),
         // Microphone. Unlike `rdpecam`, registering the `audin` channel is not
         // enough: a server opens AUDIO_INPUT only for a client that advertises
         // audio-capture support in its info PDU, which is this capability bit.
@@ -2933,6 +2946,59 @@ mod tests {
             }
             sys::freerdp_settings_free(settings);
         }
+    }
+
+    /// The two audio settings are a *mode*, not a switch, and the off position is "leave the
+    /// sound on the host" rather than "mute the session". Pinned because the difference is
+    /// invisible from this side: both connect, both are silent here, and only the host's own
+    /// speakers — or a headset paired to it — tell them apart.
+    #[test]
+    fn audio_off_leaves_sound_on_the_host() {
+        use crate::audio::{AudioFormat, AudioSink};
+
+        struct Mute;
+        impl AudioSink for Mute {
+            fn negotiated(&self, _: usize) {}
+            fn opened(&self, _: AudioFormat) {}
+            fn wave(&self, _: &[u8]) {}
+            fn closed(&self) {}
+        }
+
+        fn audio_mode(config: &Connect) -> (bool, bool) {
+            use sys::FreeRDP_Settings_Keys_Bool as B;
+            let mut entry: sys::RDP_CLIENT_ENTRY_POINTS = unsafe { std::mem::zeroed() };
+            entry.Size = std::mem::size_of::<sys::RDP_CLIENT_ENTRY_POINTS>() as u32;
+            entry.Version = sys::RDP_CLIENT_INTERFACE_VERSION;
+            entry.ContextSize = std::mem::size_of::<WrapperContext>() as u32;
+            entry.ClientNew = Some(client_new);
+            entry.ClientFree = Some(client_free);
+            // SAFETY: a context created and freed here, with the same entry points `run` uses,
+            // and `apply_settings` reads only what `freerdp_client_context_new` allocated.
+            unsafe {
+                let ctx = sys::freerdp_client_context_new(&entry);
+                assert!(!ctx.is_null());
+                let guard = ContextGuard(ctx);
+                apply_settings(config, ctx).expect("apply_settings");
+                let settings = (*ctx).settings;
+                let mode = (
+                    sys::freerdp_settings_get_bool(settings, B::FreeRDP_AudioPlayback) != 0,
+                    sys::freerdp_settings_get_bool(settings, B::FreeRDP_RemoteConsoleAudio) != 0,
+                );
+                drop(guard);
+                mode
+            }
+        }
+
+        // (playback here, left on the host): FreeRDP's `/audio-mode` 1 and 0 respectively, and
+        // never 2, which is both false.
+        assert_eq!(audio_mode(&Connect::default()), (false, true));
+        assert_eq!(
+            audio_mode(&Connect {
+                audio: Some(Audio { format: AudioFormat::CD, sink: Arc::new(Mute) }),
+                ..Connect::default()
+            }),
+            (true, false)
+        );
     }
 
     /// A duration too large for FreeRDP's `UINT32` saturates rather than wrapping — a wrapped
