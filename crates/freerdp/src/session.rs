@@ -278,6 +278,57 @@ pub struct Session {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Start Winsock, once per process, because nothing in the library does it.
+///
+/// FreeRDP leaves `WSAStartup` to the application on Windows. WinPR's own is the Unix stub, in
+/// the `#else /* _WIN32 */` branch of `winpr/libwinpr/winsock/winsock.c`, so it is never the one
+/// compiled here; FreeRDP's Windows client calls the real one from its entry point
+/// (`client/Windows/wf_client.c`). This crate is a library and has no entry point to do that in,
+/// so it does it on the way to the first connection instead.
+///
+/// Without it every name lookup fails with `WSANOTINITIALISED` before a packet moves, and
+/// FreeRDP reports that as `ERRCONNECT_DNS_NAME_NOT_FOUND` — measured against a literal
+/// `127.0.0.1`, which is why it does not read as a Winsock problem when it happens. `remotex`
+/// never saw it because tokio's mio starts Winsock building the runtime, long before any engine
+/// connects; that is an accident of ordering and not something this crate should rely on.
+///
+/// No `WSACleanup` to match. The count it decrements is per process, and a `Session` that has
+/// ended cannot know that another one — or the embedder's own sockets — is not still using it.
+/// Windows reclaims it when the process exits.
+#[cfg(windows)]
+fn ensure_winsock() {
+    /// `WSADATA` under `_WIN64`, where the vendor pointer sits ahead of the two strings rather
+    /// than after them. Declared rather than bound because it is only ever written to: nothing
+    /// here reads a field, so all that has to be right is the size and alignment of the buffer
+    /// `WSAStartup` fills. The archives are 64-bit only, so there is no other layout to carry.
+    #[repr(C)]
+    struct WsaData {
+        version: u16,
+        high_version: u16,
+        max_sockets: u16,
+        max_udp_dg: u16,
+        vendor_info: *mut i8,
+        description: [i8; 257],
+        system_status: [i8; 129],
+    }
+
+    // `ws2_32` is already on every consumer's link line — the archives' MANIFEST lists it under
+    // `system_libs` — so this resolves without asking anyone to add a library.
+    unsafe extern "system" {
+        fn WSAStartup(version: u16, data: *mut WsaData) -> i32;
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut data = std::mem::MaybeUninit::<WsaData>::uninit();
+        // 2.2, the version every Windows since 98 answers and the one FreeRDP's own servers ask
+        // for. The failure is not raised: a process whose Winsock will not start has worse
+        // trouble than this connection, and the connect below reports it in its own words.
+        // SAFETY: `data` is a live, correctly sized and aligned buffer for the duration.
+        let _ = unsafe { WSAStartup(0x0202, data.as_mut_ptr()) };
+    });
+}
+
 impl Session {
     /// Connect, on a thread of its own.
     ///
@@ -287,6 +338,9 @@ impl Session {
     /// desktop), and a `Session::start` that blocked for them would have to be called from a
     /// thread the caller was willing to lose anyway.
     pub fn start(config: Connect) -> (Self, Receiver<Event>) {
+        #[cfg(windows)]
+        ensure_winsock();
+
         let (events, receiver) = std::sync::mpsc::channel();
         let clipboard_enabled = config.clipboard;
         let shared = Arc::new(Shared::new());
