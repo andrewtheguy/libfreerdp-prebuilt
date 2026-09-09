@@ -85,7 +85,17 @@ fn offline_checks() {
     });
     let event = events.recv_timeout(Duration::from_secs(30)).expect("no event from a refused connect");
     match event {
-        Event::Ended(Err(error)) => println!("refused connect  {error}"),
+        // *How* it failed, not merely that it did. The kernel refuses port 1, so the only honest
+        // answer is one `is_unreachable` accepts — and anything else means the connection never
+        // got as far as the transport. That is not pedantry: a Windows archive whose process has
+        // no Winsock fails `getaddrinfo` on this literal `127.0.0.1` and reports it as
+        // `ERRCONNECT_DNS_NAME_NOT_FOUND`, which the old `Err(_)` here accepted silently. This
+        // check is the reason that cannot pass again.
+        Event::Ended(Err(error)) if error.is_unreachable() => println!("refused connect  {error}"),
+        Event::Ended(Err(error)) => panic!(
+            "127.0.0.1:1 should have failed as an unreachable transport, and failed as \
+             {error:?} instead — on Windows this is what an uninitialised Winsock looks like"
+        ),
         // Not a soft failure. An `Ok` here would mean a connection to port 1 succeeded, and a
         // `Connected` would mean something is listening that should not be — either way the
         // result below tells us nothing about the archive.
