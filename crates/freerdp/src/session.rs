@@ -3015,4 +3015,130 @@ mod tests {
         assert_eq!(millis(Duration::MAX), u32::MAX);
         assert_eq!(millis(Duration::from_secs(1)), 1000);
     }
+
+    /// SSPI's `SecBuffer` and `SecBufferDesc`, spelled here rather than taken from the bindings.
+    /// The Windows header names them `_SecBuffer`/`_SecBufferDesc` and the Unix one names them
+    /// without the underscore, so no one path through `sys::` compiles on every target; the
+    /// layout is the same everywhere and is what the call below actually needs.
+    #[repr(C)]
+    struct SecBuffer {
+        cb_buffer: u32,
+        buffer_type: u32,
+        pv_buffer: *mut std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct SecBufferDesc {
+        ul_version: u32,
+        c_buffers: u32,
+        p_buffers: *mut SecBuffer,
+    }
+
+    /// The security package `Security::Nla` ends up asking for is one this archive can dispatch.
+    ///
+    /// `nla.c` authenticates through `Negotiate`, and every step of that goes through the SSPI
+    /// function table this asks for here: acquire a credential handle for the package, then hand
+    /// that handle straight back for the first `InitializeSecurityContext`. The status is not
+    /// asserted — with no credentials there is nothing to negotiate and each target fails its own
+    /// way — but `SEC_E_SECPKG_NOT_FOUND` means the *handle itself* did not name a package the
+    /// table knows, which no argument here can cause and no server can fix.
+    ///
+    /// It is a regression test for one line of `build.sh`. A Windows archive built with
+    /// `WITH_NATIVE_SSPI=OFF` reaches WinPR's own dispatcher, which reads the package name out of
+    /// the credential handle as a narrow string while every package wrote it wide under `UNICODE`
+    /// — so `L"Negotiate"` goes in, `"N"` comes back, and every NLA connection this crate makes on
+    /// Windows dies with `ERRCONNECT_AUTHENTICATION_FAILED` before sending a credential.
+    #[test]
+    fn the_negotiate_package_is_dispatchable() {
+        // `ULONG` in SSPI's own headers, and 32 bits wide in every one of these bindings —
+        // unlike `c_ulong`, which is 64 bits on the Unix targets.
+        const SECPKG_CRED_OUTBOUND: u32 = 2;
+        const SECURITY_NATIVE_DREP: u32 = 0x10;
+        const ISC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
+        const SECBUFFER_TOKEN: u32 = 2;
+        const SECBUFFER_VERSION: u32 = 0;
+        const SEC_E_SECPKG_NOT_FOUND: i32 = 0x8009_0305u32 as i32;
+
+        // `SecHandle` is spelled differently in each target's bindings; its layout is not, and the
+        // bindings assert that layout themselves. Two words is the whole struct.
+        let mut credential = [0usize; 2];
+        let mut context = [0usize; 2];
+        let mut package: Vec<u16> = "Negotiate".encode_utf16().chain(Some(0)).collect();
+        let mut target: Vec<u16> = "TERMSRV/host".encode_utf16().chain(Some(0)).collect();
+
+        // SAFETY: every pointer below outlives the two calls, and the output descriptor is the
+        // shape SSPI documents for a first client token — one empty `SECBUFFER_TOKEN` the package
+        // fills in, since `ISC_REQ_ALLOCATE_MEMORY` says the package allocates it.
+        unsafe {
+            sys::sspi_GlobalInit();
+            let table = sys::InitSecurityInterfaceExW(0);
+            assert!(!table.is_null(), "no unicode SSPI function table");
+
+            let acquire =
+                (*table).AcquireCredentialsHandleW.expect("no AcquireCredentialsHandleW");
+            let status = acquire(
+                std::ptr::null_mut(),
+                package.as_mut_ptr(),
+                SECPKG_CRED_OUTBOUND,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                credential.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            );
+            assert_ne!(
+                status, SEC_E_SECPKG_NOT_FOUND,
+                "this archive's SSPI has no Negotiate package to acquire a credential from"
+            );
+            if status != 0 {
+                return; // Nothing to hand to the next call, and that is not what is under test.
+            }
+
+            let mut token = SecBuffer {
+                cb_buffer: 0,
+                buffer_type: SECBUFFER_TOKEN,
+                pv_buffer: std::ptr::null_mut(),
+            };
+            let mut output = SecBufferDesc {
+                ul_version: SECBUFFER_VERSION,
+                c_buffers: 1,
+                p_buffers: &mut token,
+            };
+            let mut attributes: u32 = 0;
+            let initialize =
+                (*table).InitializeSecurityContextW.expect("no InitializeSecurityContextW");
+            let status = initialize(
+                credential.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+                target.as_mut_ptr(),
+                ISC_REQ_ALLOCATE_MEMORY,
+                0,
+                SECURITY_NATIVE_DREP,
+                std::ptr::null_mut(),
+                0,
+                context.as_mut_ptr().cast(),
+                (&mut output as *mut SecBufferDesc).cast(),
+                &mut attributes,
+                std::ptr::null_mut(),
+            );
+            assert_ne!(
+                status, SEC_E_SECPKG_NOT_FOUND,
+                "the credential handle did not name a package this archive's SSPI knows — the \
+                 name went in wide and came back narrow (build.sh: WITH_NATIVE_SSPI)"
+            );
+
+            if !token.pv_buffer.is_null() {
+                if let Some(free) = (*table).FreeContextBuffer {
+                    free(token.pv_buffer);
+                }
+            }
+            if let Some(delete) = (*table).DeleteSecurityContext {
+                delete(context.as_mut_ptr().cast());
+            }
+            if let Some(free) = (*table).FreeCredentialsHandle {
+                free(credential.as_mut_ptr().cast());
+            }
+        }
+    }
 }

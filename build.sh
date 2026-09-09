@@ -407,10 +407,33 @@ if [ -n "$windows" ]; then
     # Defaults ON on WIN32: a winmm `rdpsnd`/`audin` backend beside the consumer's own, and
     # `winmm.lib` on every consumer's link line for it.
     -DWITH_WINMM=OFF
-    # Defaults ON on WIN32: NTLM and CredSSP through secur32 loaded at run time, instead of the
-    # WinPR path over the OpenSSL built above — the one the MD4/RC4 assertions and every other
-    # target cover.
-    -DWITH_NATIVE_SSPI=OFF
+    # FreeRDP's own default on WIN32, spelled out because turning it off is what this build did
+    # until it was measured: NTLM and CredSSP through secur32 loaded at run time, rather than the
+    # WinPR path over the OpenSSL built above.
+    #
+    # The WinPR path is the tidier story — one implementation on every target, the one the MD4/RC4
+    # assertions cover — and on Windows it does not work at all. WinPR's own SSPI dispatcher reads
+    # the package name back out of a credential handle as a *narrow* string
+    # (`sspi_winpr.c`, `sspi_GetSecurityFunctionTableWByNameA`), while every package writes it in
+    # with `_T()` — wide, because `CMakeLists.txt` defines `UNICODE` on every Windows build. So
+    # `L"Negotiate"` goes in and `"N"` comes back out, matching no package. Measured on
+    # 3.30.0, connecting to a Windows host: `AcquireCredentialsHandleW` succeeds, then
+    # `InitializeSecurityContextW` returns `SEC_E_SECPKG_NOT_FOUND` (0x80090305), NLA begins and
+    # fails, and the connection ends as `ERRCONNECT_AUTHENTICATION_FAILED` before a credential
+    # has been sent. The same archive on Linux and macOS connects, because `_T(x)` is `x` there.
+    #
+    # Upstream never sees it: with this option at its default the native table replaces WinPR's
+    # and the dispatcher above is dead code. That is what this line buys back. The MD4/RC4
+    # assertions still cover the code they always did — Windows just no longer reaches it for NLA.
+    #
+    # What it costs, measured the same day: secur32 answers out of the caller's LSA logon session,
+    # so a Windows process that has none cannot finish NLA. A publickey ssh session is the case
+    # that turns up — its token is an S4U construct, `klist` there says "a specified logon session
+    # does not exist", the first `InitializeSecurityContext` still returns a token and the second
+    # returns `SEC_E_UNKNOWN_CREDENTIALS` (0x8009030d). WinPR's own SSPI never touched LSA and did
+    # not care. Consumers run interactively, where the session is real; a consumer that must
+    # authenticate from a context without one wants its own `LIBFREERDP` build, not this default.
+    -DWITH_NATIVE_SSPI=ON
     -DWITH_WIN8=OFF -DWITH_MEDIA_FOUNDATION=OFF
     # `_WIN32_WINNT=0x0601`, FreeRDP's own default, spelled out because gen-bindings.sh compiles
     # the same headers with the same value and the two must not drift apart.
