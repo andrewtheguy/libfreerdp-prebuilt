@@ -121,7 +121,7 @@ reachable_headers() {
   "${compiler[@]}" -MM -I "$root/freerdp3" -I "$root/winpr3" "$crate/wrapper.h" \
     | tr ' ' '\n' \
     | tr -d '\r' \
-    | tr '\\' '/' \
+    | sed 's#\\#/#g' \
     | sed -n "s#^$root/##p" \
     | sort -u
 }
